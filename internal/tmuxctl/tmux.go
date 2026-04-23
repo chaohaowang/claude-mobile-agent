@@ -50,3 +50,27 @@ func (c *Client) SendCtrlC(target string) error {
 	}
 	return nil
 }
+
+// StartSession creates a new detached tmux session named `name`, with working
+// directory `cwd` and running `command` in its first pane. If a session with
+// that name already exists, this is a no-op (returns nil) — callers should
+// check HasSession first if they care about the distinction.
+func (c *Client) StartSession(name, cwd, command string) error {
+	// tmux does not overwrite an existing session; `new-session` returns an
+	// error. Short-circuit for the common "already running" case.
+	if ok, err := c.HasSession(name); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+	out, err := exec.Command(c.bin,
+		"new-session", "-d",
+		"-s", name,
+		"-c", cwd,
+		command,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux new-session: %w: %s", err, string(out))
+	}
+	return nil
+}

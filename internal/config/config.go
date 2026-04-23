@@ -26,7 +26,35 @@ type SessionConfig struct {
 	Name       string `toml:"name"`
 }
 
+// Load reads the TOML config file and validates the full set of required fields
+// (both [relay] and [session]). Use LoadRelayOnly when the session fields will
+// be supplied at runtime (e.g. the `start` subcommand derives them from a dir).
 func Load(path string) (*Config, error) {
+	c, err := loadRaw(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// LoadRelayOnly reads the same TOML file but only requires the [relay] fields.
+// Returned Config's Session may be empty; callers must fill it in before
+// handing to daemon.New.
+func LoadRelayOnly(path string) (*Config, error) {
+	c, err := loadRaw(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validateRelay(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func loadRaw(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -36,9 +64,6 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	applyDefaults(&c)
-	if err := c.validate(); err != nil {
-		return nil, err
-	}
 	return &c, nil
 }
 
@@ -54,7 +79,7 @@ func applyDefaults(c *Config) {
 	}
 }
 
-func (c *Config) validate() error {
+func (c *Config) validateRelay() error {
 	if c.Relay.URL == "" {
 		return fmt.Errorf("relay.url is required")
 	}
@@ -63,6 +88,13 @@ func (c *Config) validate() error {
 	}
 	if c.Relay.DeviceID == "" {
 		return fmt.Errorf("relay.device_id is required")
+	}
+	return nil
+}
+
+func (c *Config) validate() error {
+	if err := c.validateRelay(); err != nil {
+		return err
 	}
 	if c.Session.TmuxTarget == "" {
 		return fmt.Errorf("session.tmux_target is required")
