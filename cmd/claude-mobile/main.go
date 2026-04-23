@@ -26,7 +26,7 @@ func main() {
 	case "version":
 		fmt.Println("claude-mobile 0.0.1-dev")
 	case "daemon":
-		runDaemon()
+		runDaemon(os.Args[2:])
 	case "start":
 		runStart(os.Args[2:])
 	default:
@@ -46,17 +46,29 @@ commands:
                      --permission-mode MODE   passed to claude (default bypassPermissions)
                      --name NAME              override session name (default: basename DIR)
   daemon           start the bridge daemon from a fully specified config
-                   (reads ~/.config/claude-mobile/config.toml with [relay] + [session])
+                   (default: ~/.config/claude-mobile/config.toml with [relay] + [session])
+                   Flags:
+                     --config PATH   use a specific config file (for running
+                                     multiple daemons side-by-side with
+                                     different pair_ids / cwd)
   version          print version`)
 }
 
-func runDaemon() {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "cannot find home dir:", err)
-		os.Exit(1)
+func runDaemon(args []string) {
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	cfgPath := fs.String("config", "", "path to config toml (default: ~/.config/claude-mobile/config.toml)")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
 	}
-	path := filepath.Join(home, defaultConfigRelPath)
+	path := *cfgPath
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "cannot find home dir:", err)
+			os.Exit(1)
+		}
+		path = filepath.Join(home, defaultConfigRelPath)
+	}
 	cfg, err := config.Load(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "config:", err)

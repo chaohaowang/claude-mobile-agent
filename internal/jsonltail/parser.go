@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/chaohaow/claude-mobile-agent/internal/wire"
@@ -133,7 +134,36 @@ func LastN(path string, n int) ([]Record, error) {
 	if len(all) <= n {
 		return all, nil
 	}
-	return all[len(all)-n:], nil
+	// Keep the last n records, PLUS any user-role plain-text records from
+	// before that window — a long session dominated by tool_use/tool_result
+	// can push the user's actual prompts out of the last-N window, which
+	// leaves the phone with a view full of tool activity and no sign of what
+	// the user ever typed. Cap prefix user-text inclusion at 20 to keep the
+	// relay fanout buffer happy.
+	tail := all[len(all)-n:]
+	prefix := all[:len(all)-n]
+	var userTexts []Record
+	for _, r := range prefix {
+		if r.Role == "user" && hasPlainText(r.Content) {
+			userTexts = append(userTexts, r)
+		}
+	}
+	if len(userTexts) > 20 {
+		userTexts = userTexts[len(userTexts)-20:]
+	}
+	out := make([]Record, 0, len(userTexts)+len(tail))
+	out = append(out, userTexts...)
+	out = append(out, tail...)
+	return out, nil
+}
+
+func hasPlainText(blocks []wire.ContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseAll reads an entire reader and returns all user/assistant records.

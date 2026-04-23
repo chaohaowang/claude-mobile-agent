@@ -2,15 +2,18 @@ package daemon
 
 import (
 	"context"
+	stdBase64 "encoding/base64"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"github.com/chaohaow/claude-mobile-agent/internal/asr"
 	"github.com/chaohaow/claude-mobile-agent/internal/config"
 	"github.com/chaohaow/claude-mobile-agent/internal/jsonltail"
 	"github.com/chaohaow/claude-mobile-agent/internal/relay"
@@ -23,26 +26,54 @@ type Daemon struct {
 	cfg       *config.Config
 	tmux      *tmuxctl.Client
 	relay     *relay.Client
+	asr       *asr.Client // nil if no API key was set in env
 	seq       atomic.Uint64
 	sessID    string
-	jsonlPath string // populated by Run; used by history-req handler
+	pathMu    sync.Mutex
+	jsonlPath string // guarded by pathMu; used by history-req handler
+}
+
+func (d *Daemon) getJSONLPath() string {
+	d.pathMu.Lock()
+	defer d.pathMu.Unlock()
+	return d.jsonlPath
+}
+
+func (d *Daemon) setJSONLPath(p string) {
+	d.pathMu.Lock()
+	d.jsonlPath = p
+	d.pathMu.Unlock()
 }
 
 func New(cfg *config.Config) *Daemon {
-	return &Daemon{
+	d := &Daemon{
 		cfg:    cfg,
 		tmux:   tmuxctl.New(),
 		relay:  relay.New(cfg.Relay.URL, cfg.Relay.PairID, "agent", cfg.Relay.DeviceID),
 		sessID: cfg.Session.Name,
 	}
+	if c, err := asr.New(); err == nil {
+		d.asr = c
+	} else {
+		log.Printf("ASR disabled: %v", err)
+	}
+	return d
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
-	// View-only mode: when tmux_target is empty, skip the tmux check and the
-	// inbound handler. Outbound (jsonl → phone) still works; phone-sent frames
-	// are dropped with a log message. Useful when Claude Code is running in
-	// the user's primary terminal (not in tmux) and we just want to mirror
-	// its conversation to a phone as a read-only view.
+	// Auto-detect: if tmux_target is empty, scan tmux for a pane already running
+	// claude in our cwd and adopt it. Lets users attach the daemon to their
+	// existing session without hand-editing the config.
+	if d.cfg.Session.TmuxTarget == "" {
+		if target, ok := d.tmux.FindClaudePaneAt(d.cfg.Session.CWD); ok {
+			log.Printf("auto-detected tmux target at cwd=%s: %s", d.cfg.Session.CWD, target)
+			d.cfg.Session.TmuxTarget = target
+		}
+	}
+
+	// View-only mode: when tmux_target is (still) empty, skip the tmux check
+	// and the inbound handler. Outbound (jsonl → phone) still works;
+	// phone-sent frames are dropped with a log message.
 	viewOnly := d.cfg.Session.TmuxTarget == ""
 
 	// 1. sanity: tmux session must exist (only if not view-only)
@@ -55,7 +86,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return fmt.Errorf("tmux session %q not found — start it first", d.cfg.Session.TmuxTarget)
 		}
 	} else {
-		log.Printf("view-only mode: no tmux_target configured; phone messages will be ignored")
+		log.Printf("view-only mode: no tmux session found at cwd=%s; phone messages will be ignored", d.cfg.Session.CWD)
 	}
 
 	// 2. locate jsonl
@@ -65,7 +96,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("locate jsonl: %w", err)
 	}
-	d.jsonlPath = jsonlPath
+	d.setJSONLPath(jsonlPath)
 	log.Printf("tailing jsonl: %s", jsonlPath)
 
 	// 3. connect relay
@@ -73,10 +104,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("relay connect: %w", err)
 	}
 
-	// 4. start tail goroutine → sends session.message frames
+	// 4. start tail goroutine with rotation watcher — Claude Code opens a new
+	// jsonl on /clear or session rotation, so we re-check periodically and
+	// swap the tailer when a newer file appears.
 	records := make(chan jsonltail.Record, 64)
-	tailer := jsonltail.NewTailer(jsonlPath, 200*time.Millisecond)
-	go func() { _ = tailer.Run(ctx, records) }()
+	go d.tailWithRotation(ctx, projectsRoot, records)
 
 	// 5. start inbound-frame handler → tmux send-keys (skip in view-only)
 	if !viewOnly {
@@ -115,6 +147,51 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 }
 
+// tailWithRotation runs a tailer for the current jsonl and periodically checks
+// whether a newer jsonl has appeared in the project directory (which happens
+// when Claude Code starts a new session, e.g. after /clear). When rotation is
+// detected, it cancels the current tailer and starts a new one tailing the
+// new file from the beginning — a fresh jsonl is small and we want the phone
+// to see whatever has already been written there.
+func (d *Daemon) tailWithRotation(ctx context.Context, projectsRoot string, out chan<- jsonltail.Record) {
+	var (
+		tailCancel context.CancelFunc
+		startFromBeginning bool // first tailer keeps default (tail-from-end)
+	)
+	spawn := func(path string) {
+		tailCtx, cancel := context.WithCancel(ctx)
+		tailCancel = cancel
+		t := jsonltail.NewTailer(path, 200*time.Millisecond)
+		t.StartFromBeginning = startFromBeginning
+		go func() { _ = t.Run(tailCtx, out) }()
+	}
+	spawn(d.getJSONLPath())
+	startFromBeginning = true // subsequent rotations: read the new file fully
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			if tailCancel != nil {
+				tailCancel()
+			}
+			return
+		case <-ticker.C:
+			newest, err := sessionmgr.FindActiveJSONL(projectsRoot, d.cfg.Session.CWD)
+			if err != nil {
+				continue
+			}
+			if newest != d.getJSONLPath() {
+				log.Printf("jsonl rotated: %s → %s", d.getJSONLPath(), newest)
+				tailCancel()
+				d.setJSONLPath(newest)
+				spawn(newest)
+			}
+		}
+	}
+}
+
 func (d *Daemon) handleIncoming(ctx context.Context) {
 	for {
 		select {
@@ -141,6 +218,8 @@ func (d *Daemon) handleIncoming(ctx context.Context) {
 				}
 			case wire.SessionHistoryReq:
 				d.replyHistory(p)
+			case wire.ASRRequest:
+				go d.handleASR(p)
 			}
 		}
 	}
@@ -160,7 +239,7 @@ func (d *Daemon) replyHistory(req wire.SessionHistoryReq) {
 	if n > 200 {
 		n = 200 // cap to keep the relay buffer happy
 	}
-	recs, err := jsonltail.LastN(d.jsonlPath, n)
+	recs, err := jsonltail.LastN(d.getJSONLPath(), n)
 	if err != nil {
 		log.Printf("history read failed: %v", err)
 		return
@@ -211,7 +290,8 @@ func (d *Daemon) watchStatus(ctx context.Context) {
 		if status != "" {
 			preview = extractPreview(pane)
 		}
-		combined := status + "\x00" + preview
+		meta := extractMeta(pane)
+		combined := status + "\x00" + preview + "\x00" + meta
 		if combined == last {
 			continue
 		}
@@ -223,6 +303,7 @@ func (d *Daemon) watchStatus(ctx context.Context) {
 				SessionID: d.sessID,
 				Status:    status,
 				Preview:   preview,
+				Meta:      meta,
 			},
 		}
 		_ = d.relay.Send(frame)
@@ -355,6 +436,97 @@ func extractStatusLine(pane string) string {
 	return ""
 }
 
+// extractMeta returns Claude Code's TUI footer lines — the ctx/model/cwd
+// row and the permission-mode row ("⏵⏵ bypass permissions on …") — joined by
+// "\n". Either row may be missing; returns "" when nothing matches. These live
+// just below the input box in the terminal UI and are useful context to mirror
+// to the phone's chat screen.
+func extractMeta(pane string) string {
+	lines := strings.Split(pane, "\n")
+	var model, perm string
+	// Scan bottom-up; stop once both lines are found, or we've exhausted the
+	// last 8 non-empty lines (footer never lives further up than that).
+	seenNonEmpty := 0
+	for i := len(lines) - 1; i >= 0 && seenNonEmpty < 8 && (model == "" || perm == ""); i-- {
+		l := strings.TrimSpace(lines[i])
+		if l == "" {
+			continue
+		}
+		seenNonEmpty++
+		switch {
+		case perm == "" && strings.Contains(l, "⏵⏵"):
+			perm = l
+		case model == "" && (strings.Contains(l, "ctx:") ||
+			strings.Contains(l, "Opus") ||
+			strings.Contains(l, "Sonnet") ||
+			strings.Contains(l, "Haiku")):
+			model = l
+		}
+	}
+	out := make([]string, 0, 2)
+	if model != "" {
+		out = append(out, model)
+	}
+	if perm != "" {
+		out = append(out, perm)
+	}
+	return strings.Join(out, "\n")
+}
+
+// handleASR receives a phone-recorded clip, runs it through the Bailian ASR
+// proxy, and returns the transcript as an asr.result frame. Any error gets
+// reported back via the same frame's Error field so the phone can surface it.
+func (d *Daemon) handleASR(req wire.ASRRequest) {
+	result := wire.ASRResult{RequestID: req.RequestID}
+	defer func() {
+		frame := wire.Frame{
+			Type:    wire.FrameTypeASRResult,
+			Seq:     d.seq.Add(1),
+			Payload: result,
+		}
+		if err := d.relay.Send(frame); err != nil {
+			log.Printf("asr: send result failed: %v", err)
+		}
+	}()
+
+	if d.asr == nil {
+		result.Error = "ASR not configured on agent (missing BAILIAN_API_KEY)"
+		return
+	}
+	audio, err := stdBase64.StdEncoding.DecodeString(req.AudioB64)
+	if err != nil {
+		result.Error = fmt.Sprintf("decode audio: %v", err)
+		return
+	}
+	log.Printf("asr: transcribing %d bytes (format=%s, req=%s)", len(audio), req.Format, req.RequestID)
+	transcript, err := d.asr.Transcribe(audio, req.Format)
+	if err != nil {
+		log.Printf("asr: transcribe failed: %v", err)
+		result.Error = err.Error()
+		return
+	}
+	log.Printf("asr: raw → %q", truncateStr(transcript, 80))
+	// Fold filler words and fix punctuation via the normalization model. On
+	// failure we fall back to the raw transcript — better something than
+	// nothing, but log it so we can tune the prompt later.
+	cleaned, err := d.asr.Normalize(transcript)
+	if err != nil {
+		log.Printf("asr: normalize failed, using raw: %v", err)
+		cleaned = transcript
+	} else if cleaned != transcript {
+		log.Printf("asr: cleaned → %q", truncateStr(cleaned, 80))
+	}
+	result.Transcript = cleaned
+}
+
+func truncateStr(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:n]) + "…"
+}
+
 // drainIncoming consumes frames in view-only mode. Handles history requests
 // (so restart-the-app "show me context" works) and drops everything else
 // with a log message.
@@ -367,8 +539,12 @@ func (d *Daemon) drainIncoming(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if p, ok := f.Payload.(wire.SessionHistoryReq); ok {
+			switch p := f.Payload.(type) {
+			case wire.SessionHistoryReq:
 				d.replyHistory(p)
+				continue
+			case wire.ASRRequest:
+				go d.handleASR(p)
 				continue
 			}
 			log.Printf("view-only: dropping inbound frame type=%s seq=%d", f.Type, f.Seq)

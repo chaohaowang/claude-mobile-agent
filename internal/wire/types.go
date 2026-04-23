@@ -17,6 +17,8 @@ const (
 	FrameTypeAck               FrameType = "ack"
 	FrameTypeError             FrameType = "error"
 	FrameTypePing              FrameType = "ping"
+	FrameTypeASRRequest        FrameType = "asr.request"
+	FrameTypeASRResult         FrameType = "asr.result"
 )
 
 type ContentBlock struct {
@@ -60,12 +62,23 @@ type SessionMessage struct {
 	Msg       Message `json:"msg"`
 }
 
+// SessionStatus carries Claude Code's live TUI footer state:
+//   - Status:  the spinner line ("✳ Brewing… (3s …)"); empty when idle.
+//   - Preview: the currently-streaming assistant text block (reserved; the
+//              phone ignores it for now).
+//   - Meta:    the non-spinner footer lines — typically the ctx/model/cwd
+//              line and the "⏵⏵ bypass permissions on …" line, joined by \n.
+//              Kept as one field so adding new footer rows doesn't churn the
+//              wire schema.
 type SessionStatus struct {
 	SessionID string `json:"session_id"`
 	Status    string `json:"status"`
 	// Preview: the pane's current "being generated" content (raw tmux
 	// capture, ~25 lines above the spinner). Empty when Claude is idle.
 	Preview string `json:"preview,omitempty"`
+	// Meta: Claude Code's TUI footer (ctx/model/cwd + permission mode).
+	// One field, lines joined by \n. Empty when nothing to show.
+	Meta string `json:"meta,omitempty"`
 }
 
 type SessionSend struct {
@@ -88,6 +101,22 @@ type SessionHistoryReq struct {
 
 type Ack struct {
 	ForSeq uint64 `json:"for_seq"`
+}
+
+// ASRRequest is a phone → agent request to transcribe a recorded audio clip.
+// Audio is sent inline as base64 to keep everything on one WebSocket; a real
+// deployment should move to out-of-band HTTP upload if clip sizes grow.
+type ASRRequest struct {
+	SessionID string `json:"session_id"`
+	RequestID string `json:"request_id"`
+	AudioB64  string `json:"audio_base64"`
+	Format    string `json:"format"` // "m4a" | "mp3" | "wav"
+}
+
+type ASRResult struct {
+	RequestID  string `json:"request_id"`
+	Transcript string `json:"transcript"`
+	Error      string `json:"error,omitempty"`
 }
 
 type ErrorPayload struct {
@@ -177,6 +206,18 @@ func (f *Frame) UnmarshalJSON(data []byte) error {
 		payload = p
 	case FrameTypePing:
 		payload = struct{}{}
+	case FrameTypeASRRequest:
+		var p ASRRequest
+		if err := json.Unmarshal(rf.Payload, &p); err != nil {
+			return err
+		}
+		payload = p
+	case FrameTypeASRResult:
+		var p ASRResult
+		if err := json.Unmarshal(rf.Payload, &p); err != nil {
+			return err
+		}
+		payload = p
 	default:
 		return fmt.Errorf("unknown frame type: %s", rf.Type)
 	}

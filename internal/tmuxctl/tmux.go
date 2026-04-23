@@ -69,6 +69,65 @@ func (c *Client) SendCtrlC(target string) error {
 	return nil
 }
 
+// PaneInfo describes one tmux pane on the current server.
+type PaneInfo struct {
+	Target string // "session:window.pane"
+	Path   string // pane_current_path
+	Cmd    string // pane_current_command (e.g. "claude.exe")
+}
+
+// ListPanes enumerates every pane across every tmux session, so the caller can
+// discover whether the user already has a session running in some cwd.
+func (c *Client) ListPanes() ([]PaneInfo, error) {
+	out, err := exec.Command(c.bin, "list-panes", "-a", "-F",
+		"#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_path}\t#{pane_current_command}").Output()
+	if err != nil {
+		// tmux exits non-zero when no server is running; treat as "no panes".
+		if _, ok := err.(*exec.ExitError); ok {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("tmux list-panes: %w", err)
+	}
+	var panes []PaneInfo
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		panes = append(panes, PaneInfo{Target: parts[0], Path: parts[1], Cmd: parts[2]})
+	}
+	return panes, nil
+}
+
+// FindClaudePaneAt returns the best tmux target for a pane whose current path
+// equals `cwd`, preferring one whose foreground command looks like claude
+// (matches "claude" substring). Second arg is true when a match was found.
+func (c *Client) FindClaudePaneAt(cwd string) (string, bool) {
+	panes, err := c.ListPanes()
+	if err != nil || len(panes) == 0 {
+		return "", false
+	}
+	var fallback string
+	for _, p := range panes {
+		if p.Path != cwd {
+			continue
+		}
+		if strings.Contains(strings.ToLower(p.Cmd), "claude") {
+			return p.Target, true
+		}
+		if fallback == "" {
+			fallback = p.Target
+		}
+	}
+	if fallback != "" {
+		return fallback, true
+	}
+	return "", false
+}
+
 // CapturePane returns the visible content of a tmux pane.
 func (c *Client) CapturePane(target string) (string, error) {
 	out, err := exec.Command(c.bin, "capture-pane", "-p", "-t", target).Output()
