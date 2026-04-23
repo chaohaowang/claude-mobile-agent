@@ -33,11 +33,29 @@ func (c *Client) HasSession(target string) (bool, error) {
 
 // SendText sends literal text to a tmux pane. The `-l` flag makes tmux treat
 // the argument as a literal string rather than interpreting key names like
-// "Enter" or "C-c". To submit, include a trailing "\n".
+// "Enter" or "C-c". Does NOT submit — to submit, call SendLine instead.
 func (c *Client) SendText(target, text string) error {
 	out, err := exec.Command(c.bin, "send-keys", "-t", target, "-l", text).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("tmux send-keys: %w: %s", err, string(out))
+	}
+	return nil
+}
+
+// SendLine sends text then a real Enter keypress. Use this for submitting
+// prompts to a TUI that distinguishes pressed-Enter from pasted-LF (Claude
+// Code's readline is one such TUI).
+func (c *Client) SendLine(target, text string) error {
+	// Strip trailing newlines; we emit Enter as a key event below.
+	text = strings.TrimRight(text, "\n")
+	if text != "" {
+		if err := c.SendText(target, text); err != nil {
+			return err
+		}
+	}
+	out, err := exec.Command(c.bin, "send-keys", "-t", target, "Enter").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux send-keys Enter: %w: %s", err, string(out))
 	}
 	return nil
 }
@@ -49,6 +67,15 @@ func (c *Client) SendCtrlC(target string) error {
 		return fmt.Errorf("tmux send-keys C-c: %w: %s", err, string(out))
 	}
 	return nil
+}
+
+// CapturePane returns the visible content of a tmux pane.
+func (c *Client) CapturePane(target string) (string, error) {
+	out, err := exec.Command(c.bin, "capture-pane", "-p", "-t", target).Output()
+	if err != nil {
+		return "", fmt.Errorf("capture-pane: %w", err)
+	}
+	return string(out), nil
 }
 
 // StartSession creates a new detached tmux session named `name`, with working

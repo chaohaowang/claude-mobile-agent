@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/chaohaow/claude-mobile-agent/internal/wire"
@@ -86,12 +87,14 @@ func extractContent(msgRaw json.RawMessage) ([]wire.ContentBlock, error) {
 	}
 
 	var blocks []struct {
-		Type     string          `json:"type"`
-		Text     string          `json:"text"`
-		Thinking string          `json:"thinking"`
-		ID       string          `json:"id"`
-		Name     string          `json:"name"`
-		Input    json.RawMessage `json:"input"`
+		Type      string          `json:"type"`
+		Text      string          `json:"text"`
+		Thinking  string          `json:"thinking"`
+		ID        string          `json:"id"`
+		Name      string          `json:"name"`
+		Input     json.RawMessage `json:"input"`
+		ToolUseID string          `json:"tool_use_id"`
+		Content   json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal(env.Content, &blocks); err != nil {
 		return nil, err
@@ -99,12 +102,38 @@ func extractContent(msgRaw json.RawMessage) ([]wire.ContentBlock, error) {
 	out := make([]wire.ContentBlock, 0, len(blocks))
 	for _, b := range blocks {
 		cb := wire.ContentBlock{Type: b.Type, Text: b.Text, Thinking: b.Thinking}
-		if b.Type == "tool_use" {
+		switch b.Type {
+		case "tool_use":
 			cb.ToolUse = &wire.ToolUse{ID: b.ID, Name: b.Name, Input: b.Input}
+		case "tool_result":
+			cb.ToolUseID = b.ToolUseID
+			cb.Content = b.Content
 		}
 		out = append(out, cb)
 	}
 	return out, nil
+}
+
+// LastN reads the entire jsonl file and returns the last n user/assistant
+// records (or fewer if the file has fewer). Used to seed a new phone client
+// with recent history on connect.
+func LastN(path string, n int) ([]Record, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	all, err := ParseAll(f)
+	if err != nil {
+		return nil, err
+	}
+	if len(all) <= n {
+		return all, nil
+	}
+	return all[len(all)-n:], nil
 }
 
 // ParseAll reads an entire reader and returns all user/assistant records.

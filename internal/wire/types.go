@@ -8,14 +8,15 @@ import (
 type FrameType string
 
 const (
-	FrameTypeSessionList      FrameType = "session.list"
-	FrameTypeSessionMessage   FrameType = "session.message"
-	FrameTypeSessionStatus    FrameType = "session.status"
-	FrameTypeSessionSend      FrameType = "session.send"
-	FrameTypeSessionInterrupt FrameType = "session.interrupt"
-	FrameTypeAck              FrameType = "ack"
-	FrameTypeError            FrameType = "error"
-	FrameTypePing             FrameType = "ping"
+	FrameTypeSessionList       FrameType = "session.list"
+	FrameTypeSessionMessage    FrameType = "session.message"
+	FrameTypeSessionStatus     FrameType = "session.status"
+	FrameTypeSessionSend       FrameType = "session.send"
+	FrameTypeSessionInterrupt  FrameType = "session.interrupt"
+	FrameTypeSessionHistoryReq FrameType = "session.history.req"
+	FrameTypeAck               FrameType = "ack"
+	FrameTypeError             FrameType = "error"
+	FrameTypePing              FrameType = "ping"
 )
 
 type ContentBlock struct {
@@ -23,7 +24,10 @@ type ContentBlock struct {
 	Text     string          `json:"text,omitempty"`
 	Thinking string          `json:"thinking,omitempty"`
 	ToolUse  *ToolUse        `json:"tool_use,omitempty"`
-	Raw      json.RawMessage `json:"raw,omitempty"`
+	// tool_result fields (flat, matching Claude Code's jsonl shape)
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	Raw       json.RawMessage `json:"raw,omitempty"`
 }
 
 type ToolUse struct {
@@ -59,6 +63,9 @@ type SessionMessage struct {
 type SessionStatus struct {
 	SessionID string `json:"session_id"`
 	Status    string `json:"status"`
+	// Preview: the pane's current "being generated" content (raw tmux
+	// capture, ~25 lines above the spinner). Empty when Claude is idle.
+	Preview string `json:"preview,omitempty"`
 }
 
 type SessionSend struct {
@@ -70,6 +77,13 @@ type SessionSend struct {
 
 type SessionInterrupt struct {
 	SessionID string `json:"session_id"`
+}
+
+// SessionHistoryReq is sent from the phone asking for the last N jsonl
+// records. The agent replies with that many session.message frames.
+type SessionHistoryReq struct {
+	SessionID string `json:"session_id"`
+	Last      int    `json:"last"`
 }
 
 type Ack struct {
@@ -139,6 +153,12 @@ func (f *Frame) UnmarshalJSON(data []byte) error {
 		payload = p
 	case FrameTypeSessionInterrupt:
 		var p SessionInterrupt
+		if err := json.Unmarshal(rf.Payload, &p); err != nil {
+			return err
+		}
+		payload = p
+	case FrameTypeSessionHistoryReq:
+		var p SessionHistoryReq
 		if err := json.Unmarshal(rf.Payload, &p); err != nil {
 			return err
 		}

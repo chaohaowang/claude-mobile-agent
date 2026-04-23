@@ -27,6 +27,7 @@ type Client struct {
 	ctx      context.Context
 	incoming chan wire.Frame
 	errCh    chan error
+	writeMu  sync.Mutex // serializes WriteMessage across goroutines
 }
 
 func New(base, pairID, role, deviceID string) *Client {
@@ -141,8 +142,9 @@ func (c *Client) readLoop(ctx context.Context) {
 	}
 }
 
-// Send writes one frame to the connection. Not safe for concurrent use —
-// caller must serialize writes (e.g. single writer goroutine).
+// Send writes one frame to the connection. Safe to call from multiple
+// goroutines; writes are serialized via an internal mutex (gorilla/websocket
+// forbids concurrent WriteMessage calls on the same conn).
 func (c *Client) Send(f wire.Frame) error {
 	c.mu.Lock()
 	conn := c.conn
@@ -159,5 +161,7 @@ func (c *Client) Send(f wire.Frame) error {
 	if err != nil {
 		return err
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	return conn.WriteMessage(websocket.TextMessage, data)
 }

@@ -15,6 +15,8 @@ func TestEncodeCWDToProjectDir(t *testing.T) {
 		{"/Users/chaohaowang", "-Users-chaohaowang"},
 		{"/tmp/my-project", "-tmp-my-project"},
 		{"/a/b/c", "-a-b-c"},
+		{"/Users/foo/claude_remote", "-Users-foo-claude-remote"},
+		{"/path/with_many_underscores", "-path-with-many-underscores"},
 	}
 	for _, c := range cases {
 		assert.Equal(t, c.want, EncodeCWDToProjectDir(c.cwd), c.cwd)

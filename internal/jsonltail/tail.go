@@ -9,12 +9,17 @@ import (
 	"time"
 )
 
-// Tailer polls a file for new lines and emits parsed records. It starts at
-// the beginning of the file, which is correct on first attach — the caller
-// can skip historical records if undesired.
+// Tailer polls a file for new lines and emits parsed records.
+//
+// By default it starts at the END of the existing file — phone clients care
+// about live conversation, not history replay, and the relay has a small
+// fanout buffer that gets flooded if we replay thousands of historical lines
+// on daemon restart. Flip StartFromBeginning=true to change behavior (useful
+// for tests and for the integration test in daemon/).
 type Tailer struct {
-	path     string
-	interval time.Duration
+	path               string
+	interval           time.Duration
+	StartFromBeginning bool
 }
 
 func NewTailer(path string, interval time.Duration) *Tailer {
@@ -27,6 +32,13 @@ func (t *Tailer) Run(ctx context.Context, out chan<- Record) error {
 		ticker = time.NewTicker(t.interval)
 	)
 	defer ticker.Stop()
+
+	// Seek to current end of file if we're not replaying history.
+	if !t.StartFromBeginning {
+		if fi, err := os.Stat(t.path); err == nil {
+			offset = fi.Size()
+		}
+	}
 
 	for {
 		select {

@@ -96,9 +96,8 @@ func (c *Config) validate() error {
 	if err := c.validateRelay(); err != nil {
 		return err
 	}
-	if c.Session.TmuxTarget == "" {
-		return fmt.Errorf("session.tmux_target is required")
-	}
+	// session.cwd is always required — the daemon needs it to find the jsonl.
+	// session.tmux_target is optional: empty means view-only (no inbound).
 	if c.Session.CWD == "" {
 		return fmt.Errorf("session.cwd is required")
 	}

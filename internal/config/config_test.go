@@ -60,3 +60,20 @@ cwd = "/tmp"
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "pair_id")
 }
+
+func TestLoad_TmuxTargetOptional_ViewOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	os.WriteFile(path, []byte(`
+[relay]
+url = "ws://localhost"
+pair_id = "p"
+device_id = "d"
+
+[session]
+cwd = "/tmp"
+`), 0644)
+	cfg, err := Load(path)
+	assert.NoError(t, err)
+	assert.Equal(t, "", cfg.Session.TmuxTarget)
+}

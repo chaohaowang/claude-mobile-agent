@@ -8,10 +8,13 @@ import (
 )
 
 // EncodeCWDToProjectDir mirrors how Claude Code names project subdirectories
-// under ~/.claude/projects: every "/" in the cwd is replaced with "-".
-// "/Users/chaohaowang" → "-Users-chaohaowang"
+// under ~/.claude/projects. Empirically Claude Code translates both "/" and
+// "_" to "-". So "/Users/foo/claude_remote" becomes
+// "-Users-foo-claude-remote".
 func EncodeCWDToProjectDir(cwd string) string {
-	return strings.ReplaceAll(cwd, "/", "-")
+	s := strings.ReplaceAll(cwd, "/", "-")
+	s = strings.ReplaceAll(s, "_", "-")
+	return s
 }
 
 // FindActiveJSONL returns the most-recently-modified *.jsonl under the project
