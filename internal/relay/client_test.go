@@ -47,7 +47,7 @@ func TestClient_SendAndReceive(t *testing.T) {
 	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-	c := New(wsURL)
+	c := New(wsURL, "p1", "agent", "devA")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	assert.NoError(t, c.Connect(ctx))
@@ -76,7 +76,7 @@ func TestClient_ReconnectsAfterDisconnect(t *testing.T) {
 	srv, _, _ := startEchoServer(t)
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-	c := New(wsURL)
+	c := New(wsURL, "p1", "agent", "devA")
 	c.ReconnectInitial = 50 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

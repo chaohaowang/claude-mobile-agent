@@ -66,7 +66,13 @@ func TestIntegration_JSONLToRelay(t *testing.T) {
 
 	// 4. build a config pointing at our fixtures
 	cfg := &config.Config{
-		Relay:   config.RelayConfig{URL: wsURL, ReconnectInitialSec: 1, ReconnectMaxSec: 5},
+		Relay: config.RelayConfig{
+			URL:                 wsURL,
+			ReconnectInitialSec: 1,
+			ReconnectMaxSec:     5,
+			PairID:              "itest-pair",
+			DeviceID:            "itest-agent",
+		},
 		Session: config.SessionConfig{TmuxTarget: tmuxName, CWD: cwd, Name: "itest"},
 	}
 

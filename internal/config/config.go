@@ -17,6 +17,7 @@ type RelayConfig struct {
 	ReconnectInitialSec int    `toml:"reconnect_initial_sec"`
 	ReconnectMaxSec     int    `toml:"reconnect_max_sec"`
 	PairID              string `toml:"pair_id"`
+	DeviceID            string `toml:"device_id"`
 }
 
 type SessionConfig struct {
@@ -56,6 +57,12 @@ func applyDefaults(c *Config) {
 func (c *Config) validate() error {
 	if c.Relay.URL == "" {
 		return fmt.Errorf("relay.url is required")
+	}
+	if c.Relay.PairID == "" {
+		return fmt.Errorf("relay.pair_id is required")
+	}
+	if c.Relay.DeviceID == "" {
+		return fmt.Errorf("relay.device_id is required")
 	}
 	if c.Session.TmuxTarget == "" {
 		return fmt.Errorf("session.tmux_target is required")

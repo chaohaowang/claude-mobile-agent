@@ -14,6 +14,8 @@ func TestLoad_DefaultsApplied(t *testing.T) {
 	err := os.WriteFile(path, []byte(`
 [relay]
 url = "ws://localhost:9999/ws"
+pair_id = "abc"
+device_id = "dev1"
 
 [session]
 tmux_target = "claude-mobile:0"
@@ -41,4 +43,20 @@ func TestLoad_MissingRequiredField(t *testing.T) {
 	_, err := Load(path)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "relay.url")
+}
+
+func TestLoad_MissingPairID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	os.WriteFile(path, []byte(`
+[relay]
+url = "ws://localhost"
+
+[session]
+tmux_target = "x:0"
+cwd = "/tmp"
+`), 0644)
+	_, err := Load(path)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "pair_id")
 }

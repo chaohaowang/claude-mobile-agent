@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,9 +29,18 @@ type Client struct {
 	errCh    chan error
 }
 
-func New(url string) *Client {
+func New(base, pairID, role, deviceID string) *Client {
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	fullURL := fmt.Sprintf("%s%spair=%s&role=%s&device=%s",
+		base, sep,
+		url.QueryEscape(pairID),
+		url.QueryEscape(role),
+		url.QueryEscape(deviceID))
 	return &Client{
-		url:              url,
+		url:              fullURL,
 		ReconnectInitial: 1 * time.Second,
 		ReconnectMax:     60 * time.Second,
 		incoming:         make(chan wire.Frame, 64),

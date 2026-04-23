@@ -29,7 +29,7 @@ func New(cfg *config.Config) *Daemon {
 	return &Daemon{
 		cfg:    cfg,
 		tmux:   tmuxctl.New(),
-		relay:  relay.New(cfg.Relay.URL),
+		relay:  relay.New(cfg.Relay.URL, cfg.Relay.PairID, "agent", cfg.Relay.DeviceID),
 		sessID: cfg.Session.Name,
 	}
 }
