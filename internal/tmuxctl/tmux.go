@@ -30,3 +30,23 @@ func (c *Client) HasSession(target string) (bool, error) {
 	}
 	return false, fmt.Errorf("tmux has-session: %w", err)
 }
+
+// SendText sends literal text to a tmux pane. The `-l` flag makes tmux treat
+// the argument as a literal string rather than interpreting key names like
+// "Enter" or "C-c". To submit, include a trailing "\n".
+func (c *Client) SendText(target, text string) error {
+	out, err := exec.Command(c.bin, "send-keys", "-t", target, "-l", text).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux send-keys: %w: %s", err, string(out))
+	}
+	return nil
+}
+
+// SendCtrlC sends a literal Ctrl-C to interrupt the running program.
+func (c *Client) SendCtrlC(target string) error {
+	out, err := exec.Command(c.bin, "send-keys", "-t", target, "C-c").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux send-keys C-c: %w: %s", err, string(out))
+	}
+	return nil
+}
