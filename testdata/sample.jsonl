@@ -1,0 +1,5 @@
+{"type":"permission-mode","permissionMode":"default","sessionId":"s1"}
+{"parentUuid":null,"type":"user","message":{"role":"user","content":"hello"},"uuid":"u1","timestamp":"2026-04-19T15:53:38.358Z","cwd":"/tmp","sessionId":"s1","version":"2.1.92"}
+{"parentUuid":"u1","type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"hi there"}]},"uuid":"a1","timestamp":"2026-04-19T15:53:39.000Z","cwd":"/tmp","sessionId":"s1"}
+{"parentUuid":"a1","type":"assistant","message":{"id":"m2","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"uuid":"a2","timestamp":"2026-04-19T15:53:40.000Z","cwd":"/tmp","sessionId":"s1"}
+{"parentUuid":"a2","type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"README.md\ngo.mod"}]},"uuid":"u2","timestamp":"2026-04-19T15:53:40.500Z","cwd":"/tmp","sessionId":"s1"}
