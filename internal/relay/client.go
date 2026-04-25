@@ -15,11 +15,25 @@ import (
 	"github.com/chaohaow/claude-mobile-agent/internal/wire"
 )
 
+// Ping/pong timing — Alibaba Cloud SLB silently drops idle WebSockets after
+// roughly 10 minutes, and many other intermediaries do similar things. We send
+// a control ping every PingInterval and require a pong within PongTimeout, so
+// the connection either stays warm or dies fast enough that auto-reconnect
+// kicks in inside one ping cycle.
+const (
+	defaultPingInterval = 30 * time.Second
+	defaultPongTimeout  = 70 * time.Second // > 2 × ping interval, tolerates one drop
+	defaultWriteTimeout = 10 * time.Second
+)
+
 type Client struct {
 	url string
 
 	ReconnectInitial time.Duration
 	ReconnectMax     time.Duration
+	PingInterval     time.Duration
+	PongTimeout      time.Duration
+	WriteTimeout     time.Duration
 
 	mu       sync.Mutex
 	conn     *websocket.Conn
@@ -44,6 +58,9 @@ func New(base, pairID, role, deviceID string) *Client {
 		url:              fullURL,
 		ReconnectInitial: 1 * time.Second,
 		ReconnectMax:     60 * time.Second,
+		PingInterval:     defaultPingInterval,
+		PongTimeout:      defaultPongTimeout,
+		WriteTimeout:     defaultWriteTimeout,
 		incoming:         make(chan wire.Frame, 64),
 		errCh:            make(chan error, 1),
 	}
@@ -71,6 +88,14 @@ func (c *Client) dial(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", c.url, err)
 	}
+	// Arm the read deadline; the pong handler keeps pushing it forward as
+	// long as the peer is responsive. If pongs stop, ReadMessage will
+	// surface i/o timeout and the run loop will reconnect.
+	conn.SetReadDeadline(time.Now().Add(c.PongTimeout))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(c.PongTimeout))
+		return nil
+	})
 	c.mu.Lock()
 	c.conn = conn
 	c.closed = false
@@ -78,10 +103,48 @@ func (c *Client) dial(ctx context.Context) error {
 	return nil
 }
 
+// pingLoop sends a WebSocket control ping every PingInterval. The matching
+// pong reply triggers SetPongHandler in dial(), refreshing the read deadline.
+// Returns when ctx is cancelled or a write fails (which means the conn is
+// already dead and readLoop is about to surface the same error).
+func (c *Client) pingLoop(ctx context.Context, conn *websocket.Conn) {
+	t := time.NewTicker(c.PingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			c.writeMu.Lock()
+			err := conn.WriteControl(
+				websocket.PingMessage,
+				nil,
+				time.Now().Add(c.WriteTimeout),
+			)
+			c.writeMu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
 func (c *Client) run(ctx context.Context) {
 	backoff := c.ReconnectInitial
 	for {
+		// Start a ping loop tied to this connection's lifetime. When
+		// readLoop returns (because the conn died or ctx was cancelled),
+		// we cancel pingCtx so the goroutine exits before reconnect.
+		c.mu.Lock()
+		conn := c.conn
+		c.mu.Unlock()
+		pingCtx, cancelPing := context.WithCancel(ctx)
+		if conn != nil {
+			go c.pingLoop(pingCtx, conn)
+		}
+
 		c.readLoop(ctx)
+		cancelPing()
 
 		c.mu.Lock()
 		if c.conn != nil {

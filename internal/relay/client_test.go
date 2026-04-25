@@ -72,6 +72,49 @@ func TestClient_SendAndReceive(t *testing.T) {
 	mu.Unlock()
 }
 
+// TestClient_SendsPings asserts the client emits WebSocket control pings at
+// the configured cadence. Without these, idle WS gets silently dropped by
+// upstream LBs/NAT after ~10 minutes (Alibaba SLB in our case).
+func TestClient_SendsPings(t *testing.T) {
+	upg := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var pings int
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upg.Upgrade(w, r, nil)
+		assert.NoError(t, err)
+		defer c.Close()
+		c.SetPingHandler(func(appData string) error {
+			mu.Lock()
+			pings++
+			mu.Unlock()
+			return c.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+		})
+		// Drain frames so ReadMessage drives the ping handler.
+		for {
+			if _, _, err := c.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	c := New(wsURL, "p1", "agent", "devA")
+	c.PingInterval = 40 * time.Millisecond
+	c.PongTimeout = 1 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	assert.NoError(t, c.Connect(ctx))
+
+	// Wait long enough to see at least 3 pings.
+	time.Sleep(220 * time.Millisecond)
+	mu.Lock()
+	got := pings
+	mu.Unlock()
+	assert.GreaterOrEqual(t, got, 3, "expected at least 3 pings, got %d", got)
+}
+
 func TestClient_ReconnectsAfterDisconnect(t *testing.T) {
 	srv, _, _ := startEchoServer(t)
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
