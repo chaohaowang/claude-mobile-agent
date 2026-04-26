@@ -1,90 +1,108 @@
 # claude-mobile-agent
 
-Bridge your Mac's [Claude Code](https://docs.claude.com/claude-code) sessions to your iPhone over WebSocket. Read messages, drive the prompt, send `Esc` — all from your phone, while Claude keeps running in tmux on your Mac.
+把 Mac 上的 [Claude Code](https://docs.claude.com/claude-code) 终端会话桥接到 iPhone：手机上看消息、回消息、按 Esc 中断。Mac 这台机器一直跑着，但你人不需要在键盘前。
 
 ```
-Claude CLI (tmux pane) → jsonl tail → daemon → relay (VPS) → iPhone web
+Claude CLI (tmux) → 守护进程 → relay (VPS) → iPhone web
 ```
 
-## Install
+## 前提
+
+- macOS（Apple Silicon 或 Intel）
+- `tmux` —— `brew install tmux`
+- `claude` CLI —— [Anthropic Claude Code](https://docs.claude.com/claude-code)
+
+## 安装
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chaohaowang/claude-mobile-agent/main/install.sh | bash
 ```
 
-Installs the latest `claude-mobile` binary into `~/.local/bin/`. Or grab a tarball from the [releases](https://github.com/chaohaowang/claude-mobile-agent/releases) page and extract it yourself.
-
-## Quick start
+会装到 `~/.local/bin/claude-mobile`。如果终端找不到命令，把这行加到 `~/.zshrc` 然后 `source` 一下：
 
 ```bash
-# 1. Pair your iPhone — prints a QR code + URL.
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+## 三步上手
+
+**1. 配对手机**
+
+```bash
 claude-mobile pair
+```
 
-#    Scan with the iPhone camera (or open the URL in Safari) and bookmark it.
+打印二维码 + URL。iPhone 相机扫一下，Safari 打开后**加到主屏幕**。
 
-# 2. Start a tmux session running Claude:
-tmux new-session -d -s work 'claude'
+**2. 用 tmux 起 claude**（推荐加 `bypassPermissions`，不然手机端按不了 1/2/3 菜单）
 
-# 3. Run the daemon in the foreground:
+```bash
+tmux new-session -d -s work -c ~/some-project 'claude --permission-mode bypassPermissions'
+```
+
+`-s work` 是会话名（自己取，名字会显示在手机 tab 上）。多开几个都行：
+
+```bash
+tmux new-session -d -s blog -c ~/blog 'claude --permission-mode bypassPermissions'
+```
+
+**3. 跑守护进程**（前台一直开着）
+
+```bash
 claude-mobile daemon
 ```
 
-The daemon auto-discovers any tmux pane running `claude` and exposes them all as tabs in the iPhone web client.
+打开手机上的图标，所有 tmux 里跑着的 claude 会话都会变成 tab。
 
-## Requirements
+## 常用 tmux 命令
 
-- macOS 13+ (Apple Silicon or Intel)
-- `tmux` — `brew install tmux`
-- `claude` CLI — Anthropic [Claude Code](https://docs.claude.com/claude-code)
-
-## Configuration
-
-Auto-generated on first run at `~/.config/claude-mobile/host.toml`:
-
-```toml
-host_id    = "host-xxxxxxxxxxxx"        # random per-Mac id
-relay_url  = "ws://47.79.84.115:8443/ws"  # shared relay (default)
-public_url = "http://47.79.84.115:8443"   # baked into the pair QR
+```bash
+tmux ls                  # 看你开了哪些会话
+tmux attach -t work      # 在 Mac 上进入会话
+# 进入后按 Ctrl-b 然后 d → 离开但保持 claude 继续跑
+# 千万别 Ctrl-D 或 exit —— 那会退出 claude 把 pane 关掉
+tmux kill-session -t work    # 彻底关
 ```
 
-Edit `relay_url` / `public_url` to point at your own relay.
+## 可选：语音输入（ASR）
 
-## Optional: voice input (ASR)
-
-If you want to dictate prompts from the phone, export an Aliyun Bailian key before starting the daemon:
+想从手机上语音输入提示词，跑 daemon 前 export Aliyun 百炼 key：
 
 ```bash
 export BAILIAN_API_KEY="sk-xxxxxxxx"
 claude-mobile daemon
 ```
 
-The daemon uses `qwen3-asr-flash`. Without the key, ASR returns "not configured" to the phone; everything else still works.
+不设也行，只是手机上录音按钮会返回"未配置"。
 
-## Troubleshooting
+## 配置
 
-**`"claude-mobile" can't be opened` (Gatekeeper)** — the binary isn't notarized. The installer pipes via `curl` and avoids quarantine, but if you downloaded a tarball through Safari:
+首次跑会自动生成 `~/.config/claude-mobile/host.toml`：
 
+```toml
+host_id    = "host-xxxxxxxxxxxx"          # 这台 Mac 的随机 ID
+relay_url  = "ws://47.79.84.115:8443/ws"   # 默认走我（chaohaowang）的 relay，不存任何消息内容
+public_url = "http://47.79.84.115:8443"    # 二维码里的 URL
+```
+
+想用自己的 relay 把这两个 URL 改了即可。
+
+## 排查
+
+**首次跑被 macOS 拦"无法验证开发者"** —— 二进制没公证。
 ```bash
 xattr -d com.apple.quarantine ~/.local/bin/claude-mobile
 ```
+或右键 `claude-mobile` → 打开 → 确认。
 
-Or right-click → Open once, then macOS remembers it.
-
-**`command not found: claude-mobile`** — add `~/.local/bin` to your `PATH`:
-
+**手机空白 / 卡住** —— 守护进程可能挂了：
 ```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
+pgrep -fl 'claude-mobile daemon'        # 没输出说明没在跑
+claude-mobile daemon &                   # 后台启动
 ```
 
-**iPhone shows blank or stuck** — check the daemon is alive:
-
-```bash
-pgrep -fl 'claude-mobile daemon'
-```
-
-Restart it: `pkill -f 'claude-mobile daemon'; claude-mobile daemon &`.
+**手机看不到某个会话** —— 守护进程每 2 秒扫一次 tmux pane。新开的会话稍等就会出现。检查 pane 里 claude 是不是还活着：`tmux attach -t <名字>`。
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT —— 见 [LICENSE](LICENSE)。
