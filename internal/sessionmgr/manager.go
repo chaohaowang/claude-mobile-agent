@@ -1,47 +1,82 @@
+// Package sessionmgr owns the live set of session watchers on a Mac.
+// One watcher per session_id (cwd absolute path). The Daemon drives it
+// via Sync() each time the tmux scanner reports a fresh desired set.
 package sessionmgr
 
-import (
-	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-)
+import "sync"
 
-// EncodeCWDToProjectDir mirrors how Claude Code names project subdirectories
-// under ~/.claude/projects. Empirically Claude Code translates both "/" and
-// "_" to "-". So "/Users/foo/claude_remote" becomes
-// "-Users-foo-claude-remote".
-func EncodeCWDToProjectDir(cwd string) string {
-	s := strings.ReplaceAll(cwd, "/", "-")
-	s = strings.ReplaceAll(s, "_", "-")
-	return s
+// Watcher is the minimum a session implementation must expose. The real
+// implementation in package daemon adds jsonl tailing, status polling,
+// and a tmux send-keys target.
+type Watcher interface {
+	SessionID() string
+	Stop()
 }
 
-// FindActiveJSONL returns the most-recently-modified *.jsonl under the project
-// subdir corresponding to cwd. Returns an error if no jsonl is found.
-func FindActiveJSONL(projectsRoot, cwd string) (string, error) {
-	dir := filepath.Join(projectsRoot, EncodeCWDToProjectDir(cwd))
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return "", fmt.Errorf("read project dir %s: %w", dir, err)
+// Registry maps session_id → live Watcher.
+type Registry struct {
+	mu       sync.Mutex
+	watchers map[string]Watcher
+}
+
+func NewRegistry() *Registry {
+	return &Registry{watchers: make(map[string]Watcher)}
+}
+
+// Sync reconciles the registry against `desired`. Watchers in the
+// registry but not in desired are stopped and removed. New ids in
+// desired call `spawn(id)` to mint a fresh Watcher. Returns the
+// added/removed id lists for the caller to broadcast as session.list.
+func (r *Registry) Sync(desired []string, spawn func(id string) Watcher) (added, removed []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	desiredSet := make(map[string]struct{}, len(desired))
+	for _, id := range desired {
+		desiredSet[id] = struct{}{}
 	}
-	var best string
-	var bestMod int64
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+
+	for id, w := range r.watchers {
+		if _, ok := desiredSet[id]; !ok {
+			w.Stop()
+			delete(r.watchers, id)
+			removed = append(removed, id)
+		}
+	}
+	for id := range desiredSet {
+		if _, ok := r.watchers[id]; ok {
 			continue
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if info.ModTime().UnixNano() > bestMod {
-			bestMod = info.ModTime().UnixNano()
-			best = filepath.Join(dir, e.Name())
-		}
+		r.watchers[id] = spawn(id)
+		added = append(added, id)
 	}
-	if best == "" {
-		return "", fmt.Errorf("no jsonl in %s", dir)
+	return added, removed
+}
+
+// Get returns the watcher for a session_id, or nil if none.
+func (r *Registry) Get(id string) Watcher {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.watchers[id]
+}
+
+// IDs returns the current session_id set, in unspecified order.
+func (r *Registry) IDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make([]string, 0, len(r.watchers))
+	for id := range r.watchers {
+		ids = append(ids, id)
 	}
-	return best, nil
+	return ids
+}
+
+// StopAll stops and forgets every watcher. Used during daemon shutdown.
+func (r *Registry) StopAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, w := range r.watchers {
+		w.Stop()
+		delete(r.watchers, id)
+	}
 }
