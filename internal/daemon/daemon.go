@@ -1,3 +1,8 @@
+// Package daemon owns the long-lived process that mirrors every Claude
+// Code session on the Mac to the relay over a single WebSocket. The
+// daemon polls tmux, owns one liveSession per discovered cwd, multiplexes
+// outbound frames from all sessions, and routes inbound frames to the
+// right liveSession by payload.session_id (which IS the cwd path).
 package daemon
 
 import (
@@ -14,7 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chaohaow/claude-mobile-agent/internal/asr"
-	"github.com/chaohaow/claude-mobile-agent/internal/config"
+	"github.com/chaohaow/claude-mobile-agent/internal/host"
 	"github.com/chaohaow/claude-mobile-agent/internal/jsonltail"
 	"github.com/chaohaow/claude-mobile-agent/internal/relay"
 	"github.com/chaohaow/claude-mobile-agent/internal/sessionmgr"
@@ -22,151 +27,369 @@ import (
 	"github.com/chaohaow/claude-mobile-agent/internal/wire"
 )
 
+// sessionWatcher is what each per-session worker exposes. Superset of
+// sessionmgr.Watcher — adds inbound frame handlers so the dispatcher
+// can route phone-originated frames to the right session.
+type sessionWatcher interface {
+	SessionID() string
+	Stop()
+	HandleHistory(req wire.SessionHistoryReq)
+	HandleSend(req wire.SessionSend)
+	HandleASR(req wire.ASRRequest)
+}
+
+// Daemon multiplexes every live Claude session on this Mac onto one
+// relay WebSocket. The constructor takes host.Config so the relay
+// connection uses the Mac's stable host_id as its pair key — Task 6
+// wires this up from cmd/claude-mobile.
 type Daemon struct {
-	cfg       *config.Config
-	tmux      *tmuxctl.Client
+	cfg       host.Config
 	relay     *relay.Client
-	asr       *asr.Client // nil if no API key was set in env
+	tmux      *tmuxctl.Client
+	asrClient *asr.Client
+	registry  *sessionmgr.Registry
+	outbound  chan wire.Frame
 	seq       atomic.Uint64
-	sessID    string
-	pathMu    sync.Mutex
-	jsonlPath string // guarded by pathMu; used by history-req handler
+
+	// sessions: a test-bypass map. Production path leaves this nil and
+	// dispatcher falls through to registry. Tests install fakes here so
+	// they don't need a real Registry / spawn path.
+	sessionsMu sync.Mutex
+	sessions   map[string]sessionWatcher
+
+	// tmuxTargets: cwd → tmux pane target, captured by the scanner so
+	// liveSessions can issue send-keys / capture-pane against the right
+	// pane. Updated under tmuxTargetsMu on every scan.
+	tmuxTargetsMu sync.Mutex
+	tmuxTargets   map[string]string
 }
 
-func (d *Daemon) getJSONLPath() string {
-	d.pathMu.Lock()
-	defer d.pathMu.Unlock()
-	return d.jsonlPath
-}
-
-func (d *Daemon) setJSONLPath(p string) {
-	d.pathMu.Lock()
-	d.jsonlPath = p
-	d.pathMu.Unlock()
-}
-
-func New(cfg *config.Config) *Daemon {
+// New builds a daemon ready to Run. The host.Config carries HostID
+// (relay pair key) and RelayURL.
+func New(cfg host.Config) *Daemon {
 	d := &Daemon{
-		cfg:    cfg,
-		tmux:   tmuxctl.New(),
-		relay:  relay.New(cfg.Relay.URL, cfg.Relay.PairID, "agent", cfg.Relay.DeviceID),
-		sessID: cfg.Session.Name,
+		cfg:         cfg,
+		tmux:        tmuxctl.New(),
+		registry:    sessionmgr.NewRegistry(),
+		outbound:    make(chan wire.Frame, 256),
+		tmuxTargets: make(map[string]string),
 	}
 	if c, err := asr.New(); err == nil {
-		d.asr = c
+		d.asrClient = c
 	} else {
 		log.Printf("ASR disabled: %v", err)
 	}
 	return d
 }
 
+// Run blocks until ctx is cancelled. It connects to the relay, kicks off
+// the tmux scanner, the inbound router, and the outbound multiplexer,
+// then waits for shutdown.
 func (d *Daemon) Run(ctx context.Context) error {
-	// Auto-detect: if tmux_target is empty, scan tmux for a pane already running
-	// claude in our cwd and adopt it. Lets users attach the daemon to their
-	// existing session without hand-editing the config.
-	if d.cfg.Session.TmuxTarget == "" {
-		if target, ok := d.tmux.FindClaudePaneAt(d.cfg.Session.CWD); ok {
-			log.Printf("auto-detected tmux target at cwd=%s: %s", d.cfg.Session.CWD, target)
-			d.cfg.Session.TmuxTarget = target
-		}
-	}
-
-	// View-only mode: when tmux_target is (still) empty, skip the tmux check
-	// and the inbound handler. Outbound (jsonl → phone) still works;
-	// phone-sent frames are dropped with a log message.
-	viewOnly := d.cfg.Session.TmuxTarget == ""
-
-	// 1. sanity: tmux session must exist (only if not view-only)
-	if !viewOnly {
-		ok, err := d.tmux.HasSession(d.cfg.Session.TmuxTarget)
-		if err != nil {
-			return fmt.Errorf("tmux check: %w", err)
-		}
-		if !ok {
-			return fmt.Errorf("tmux session %q not found — start it first", d.cfg.Session.TmuxTarget)
-		}
-	} else {
-		log.Printf("view-only mode: no tmux session found at cwd=%s; phone messages will be ignored", d.cfg.Session.CWD)
-	}
-
-	// 2. locate jsonl
-	home, _ := os.UserHomeDir()
-	projectsRoot := filepath.Join(home, ".claude", "projects")
-	jsonlPath, err := sessionmgr.FindActiveJSONL(projectsRoot, d.cfg.Session.CWD)
-	if err != nil {
-		return fmt.Errorf("locate jsonl: %w", err)
-	}
-	d.setJSONLPath(jsonlPath)
-	log.Printf("tailing jsonl: %s", jsonlPath)
-
-	// 3. connect relay
+	d.relay = relay.New(d.cfg.RelayURL, d.cfg.HostID, "agent", "mac-host")
 	if err := d.relay.Connect(ctx); err != nil {
 		return fmt.Errorf("relay connect: %w", err)
 	}
 
-	// 4. start tail goroutine with rotation watcher — Claude Code opens a new
-	// jsonl on /clear or session rotation, so we re-check periodically and
-	// swap the tailer when a newer file appears.
-	records := make(chan jsonltail.Record, 64)
-	go d.tailWithRotation(ctx, projectsRoot, records)
+	go d.scanLoop(ctx)
+	go d.outboundLoop(ctx)
+	go d.inboundLoop(ctx)
 
-	// 5. start inbound-frame handler → tmux send-keys (skip in view-only)
-	if !viewOnly {
-		go d.handleIncoming(ctx)
-		go d.watchStatus(ctx) // poll tmux pane for Claude Code's activity line
-	} else {
-		go d.drainIncoming(ctx)
-	}
+	<-ctx.Done()
+	d.registry.StopAll()
+	return ctx.Err()
+}
 
-	// 6. forward records to relay
+// scanLoop polls tmux every 2 s, finds every pane running `claude`, and
+// reconciles the registry against the discovered cwd set.
+func (d *Daemon) scanLoop(ctx context.Context) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	// Run an immediate scan so the first session shows up without a
+	// 2-second cold start.
+	d.scanAndSync(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case rec, ok := <-records:
+			return
+		case <-t.C:
+			d.scanAndSync(ctx)
+		}
+	}
+}
+
+func (d *Daemon) scanAndSync(ctx context.Context) {
+	panes, err := tmuxctl.ListAllClaudePanes()
+	if err != nil {
+		log.Printf("scan: %v", err)
+		return
+	}
+	// Dedupe by cwd: multiple panes in the same cwd → one session.
+	// The first-seen pane wins as the send-keys target.
+	seen := make(map[string]string, len(panes))
+	ids := make([]string, 0, len(panes))
+	for _, p := range panes {
+		if _, ok := seen[p.CWD]; ok {
+			continue
+		}
+		seen[p.CWD] = p.Target
+		ids = append(ids, p.CWD)
+	}
+
+	// Update the cwd→target map under its own lock BEFORE Sync so any
+	// liveSession that's about to spawn can read its target during init.
+	d.tmuxTargetsMu.Lock()
+	d.tmuxTargets = seen
+	d.tmuxTargetsMu.Unlock()
+
+	added, removed := d.registry.Sync(ids, func(id string) sessionmgr.Watcher {
+		// spawn runs under the registry mutex — keep cheap. liveSession's
+		// constructor only schedules goroutines, no blocking I/O.
+		return d.spawnLiveSession(ctx, id, seen[id])
+	})
+	if len(added) > 0 || len(removed) > 0 {
+		log.Printf("session set: +%v -%v (now %d)", added, removed, len(ids))
+		d.broadcastSessionList()
+	}
+}
+
+func (d *Daemon) tmuxTargetFor(cwd string) string {
+	d.tmuxTargetsMu.Lock()
+	defer d.tmuxTargetsMu.Unlock()
+	return d.tmuxTargets[cwd]
+}
+
+// inboundLoop pumps frames from the relay into dispatch.
+func (d *Daemon) inboundLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case f, ok := <-d.relay.Incoming():
 			if !ok {
-				return nil
+				return
 			}
-			frame := wire.Frame{
-				Type: wire.FrameTypeSessionMessage,
-				Seq:  d.seq.Add(1),
-				Payload: wire.SessionMessage{
-					SessionID: d.sessID,
-					Msg: wire.Message{
-						Role:    rec.Role,
-						Content: rec.Content,
-						TS:      rec.TS,
-						ID:      rec.UUID,
-					},
-				},
-			}
-			if err := d.relay.Send(frame); err != nil {
-				log.Printf("send failed (will drop, reconnect loop takes over): %v", err)
+			d.dispatch(f)
+		}
+	}
+}
+
+// outboundLoop drains outbound (every liveSession's emit) onto the relay.
+// Stamps Seq monotonically so the phone can dedupe.
+func (d *Daemon) outboundLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case f := <-d.outbound:
+			f.Seq = d.seq.Add(1)
+			if err := d.relay.Send(f); err != nil {
+				log.Printf("relay send: %v", err)
 			}
 		}
 	}
 }
 
-// tailWithRotation runs a tailer for the current jsonl and periodically checks
-// whether a newer jsonl has appeared in the project directory (which happens
-// when Claude Code starts a new session, e.g. after /clear). When rotation is
-// detected, it cancels the current tailer and starts a new one tailing the
-// new file from the beginning — a fresh jsonl is small and we want the phone
-// to see whatever has already been written there.
-func (d *Daemon) tailWithRotation(ctx context.Context, projectsRoot string, out chan<- jsonltail.Record) {
+// dispatch routes one inbound frame to the right liveSession by
+// payload.session_id (the cwd). Unknown sessions are silently dropped —
+// the phone might be talking about a session that just exited.
+func (d *Daemon) dispatch(f wire.Frame) {
+	switch p := f.Payload.(type) {
+	case wire.SessionHistoryReq:
+		if w := d.getWatcher(p.SessionID); w != nil {
+			w.HandleHistory(p)
+		}
+	case wire.SessionSend:
+		if w := d.getWatcher(p.SessionID); w != nil {
+			w.HandleSend(p)
+		}
+	case wire.SessionInterrupt:
+		// Not surfaced yet — phone has no UI for this. Wired here so
+		// adding a button later is one branch.
+	case wire.SessionListReq:
+		d.broadcastSessionList()
+	case wire.ASRRequest:
+		if w := d.getWatcher(p.SessionID); w != nil {
+			w.HandleASR(p)
+		}
+	}
+}
+
+// getWatcher returns the watcher for a session_id, or nil if absent.
+// Test-injected sessions take priority; production path consults the
+// registry.
+func (d *Daemon) getWatcher(id string) sessionWatcher {
+	d.sessionsMu.Lock()
+	if d.sessions != nil {
+		if w, ok := d.sessions[id]; ok {
+			d.sessionsMu.Unlock()
+			return w
+		}
+	}
+	d.sessionsMu.Unlock()
+	if d.registry == nil {
+		return nil
+	}
+	w := d.registry.Get(id)
+	if w == nil {
+		return nil
+	}
+	if sw, ok := w.(sessionWatcher); ok {
+		return sw
+	}
+	return nil
+}
+
+// broadcastSessionList sends the current session set to the phone. Called
+// after every scan that changed the set, and on demand for SessionListReq.
+func (d *Daemon) broadcastSessionList() {
+	var sessions []wire.SessionInfo
+	// Test-injected first.
+	d.sessionsMu.Lock()
+	if d.sessions != nil {
+		for id := range d.sessions {
+			sessions = append(sessions, wire.SessionInfo{
+				ID:   id,
+				Name: filepath.Base(id),
+				CWD:  id,
+			})
+		}
+	}
+	d.sessionsMu.Unlock()
+	// Production registry.
+	if d.registry != nil {
+		for _, id := range d.registry.IDs() {
+			sessions = append(sessions, wire.SessionInfo{
+				ID:   id,
+				Name: filepath.Base(id),
+				CWD:  id,
+			})
+		}
+	}
+	d.outbound <- wire.Frame{
+		Type:    wire.FrameTypeSessionList,
+		Payload: wire.SessionList{Sessions: sessions},
+	}
+}
+
+// ---------------------------------------------------------------------
+// liveSession — one per discovered cwd. Owns its jsonl tailer (with
+// rotation handling), its tmux status poller, and the inbound handlers
+// for that session. All outbound traffic flows through d.outbound.
+// ---------------------------------------------------------------------
+
+type liveSession struct {
+	d          *Daemon
+	cwd        string // also the session_id
+	tmuxTarget string // pane target captured at spawn time
+	cancel     context.CancelFunc
+
+	pathMu    sync.Mutex
+	jsonlPath string
+}
+
+func (s *liveSession) SessionID() string { return s.cwd }
+func (s *liveSession) Stop()              { s.cancel() }
+
+func (s *liveSession) currentJSONLPath() string {
+	s.pathMu.Lock()
+	defer s.pathMu.Unlock()
+	return s.jsonlPath
+}
+func (s *liveSession) setJSONLPath(p string) {
+	s.pathMu.Lock()
+	s.jsonlPath = p
+	s.pathMu.Unlock()
+}
+
+// spawnLiveSession constructs a liveSession and kicks off its goroutines.
+// Runs under the registry mutex (per Sync's contract) — must NOT block
+// or call back into Registry methods. All heavy lifting happens in the
+// goroutines started here.
+func (d *Daemon) spawnLiveSession(parent context.Context, cwd, tmuxTarget string) sessionWatcher {
+	home, _ := os.UserHomeDir()
+	projectsRoot := filepath.Join(home, ".claude", "projects")
+
+	// Best-effort: resolve initial jsonl path. May be empty if Claude
+	// hasn't written the first record yet — tail loop will retry.
+	jsonl, err := sessionmgr.FindActiveJSONL(projectsRoot, cwd)
+	if err != nil {
+		log.Printf("session %s: locate jsonl: %v (will retry in tail loop)", cwd, err)
+	}
+
+	// Derive a per-session ctx from the parent so daemon shutdown
+	// cascades. Stop() also cancels it directly.
+	ctx, cancel := context.WithCancel(parent)
+	s := &liveSession{
+		d:          d,
+		cwd:        cwd,
+		tmuxTarget: tmuxTarget,
+		cancel:     cancel,
+		jsonlPath:  jsonl,
+	}
+	log.Printf("session +: %s (target=%s, jsonl=%s)", cwd, tmuxTarget, jsonl)
+
+	go s.tailLoop(ctx, projectsRoot)
+	go s.statusLoop(ctx)
+	return s
+}
+
+// tailLoop tails the jsonl with rotation handling — Claude Code starts a
+// new file on /clear, and we want the new content to flow without losing
+// the live read. Mirrors the old daemon's tailWithRotation, parameterized
+// per session.
+func (s *liveSession) tailLoop(ctx context.Context, projectsRoot string) {
+	records := make(chan jsonltail.Record, 64)
+
 	var (
-		tailCancel context.CancelFunc
+		tailCancel         context.CancelFunc
 		startFromBeginning bool // first tailer keeps default (tail-from-end)
 	)
 	spawn := func(path string) {
+		if path == "" {
+			return
+		}
 		tailCtx, cancel := context.WithCancel(ctx)
 		tailCancel = cancel
 		t := jsonltail.NewTailer(path, 200*time.Millisecond)
 		t.StartFromBeginning = startFromBeginning
-		go func() { _ = t.Run(tailCtx, out) }()
+		go func() { _ = t.Run(tailCtx, records) }()
 	}
-	spawn(d.getJSONLPath())
-	startFromBeginning = true // subsequent rotations: read the new file fully
+
+	// Forward incoming records to the multiplex outbound channel.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case rec, ok := <-records:
+				if !ok {
+					return
+				}
+				select {
+				case s.d.outbound <- wire.Frame{
+					Type: wire.FrameTypeSessionMessage,
+					Payload: wire.SessionMessage{
+						SessionID: s.cwd,
+						Msg: wire.Message{
+							Role:    rec.Role,
+							Content: rec.Content,
+							TS:      rec.TS,
+							ID:      rec.UUID,
+						},
+					},
+				}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	if p := s.currentJSONLPath(); p != "" {
+		spawn(p)
+		startFromBeginning = true
+	}
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -178,100 +401,35 @@ func (d *Daemon) tailWithRotation(ctx context.Context, projectsRoot string, out 
 			}
 			return
 		case <-ticker.C:
-			newest, err := sessionmgr.FindActiveJSONL(projectsRoot, d.cfg.Session.CWD)
+			newest, err := sessionmgr.FindActiveJSONL(projectsRoot, s.cwd)
 			if err != nil {
 				continue
 			}
-			if newest != d.getJSONLPath() {
-				log.Printf("jsonl rotated: %s → %s", d.getJSONLPath(), newest)
-				tailCancel()
-				d.setJSONLPath(newest)
+			cur := s.currentJSONLPath()
+			if newest != cur {
+				if cur != "" {
+					log.Printf("session %s: jsonl rotated: %s → %s", s.cwd, cur, newest)
+				} else {
+					log.Printf("session %s: jsonl appeared: %s", s.cwd, newest)
+				}
+				if tailCancel != nil {
+					tailCancel()
+				}
+				s.setJSONLPath(newest)
 				spawn(newest)
+				startFromBeginning = true
 			}
 		}
 	}
 }
 
-func (d *Daemon) handleIncoming(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case f, ok := <-d.relay.Incoming():
-			if !ok {
-				return
-			}
-			switch p := f.Payload.(type) {
-			case wire.SessionSend:
-				if p.SessionID != d.sessID {
-					continue
-				}
-				if err := d.tmux.SendLine(d.cfg.Session.TmuxTarget, p.Text); err != nil {
-					log.Printf("send-keys failed: %v", err)
-				}
-			case wire.SessionInterrupt:
-				if p.SessionID != d.sessID {
-					continue
-				}
-				if err := d.tmux.SendCtrlC(d.cfg.Session.TmuxTarget); err != nil {
-					log.Printf("send Ctrl-C failed: %v", err)
-				}
-			case wire.SessionHistoryReq:
-				d.replyHistory(p)
-			case wire.ASRRequest:
-				go d.handleASR(p)
-			}
-		}
-	}
-}
-
-// replyHistory reads the last N records from the jsonl and sends them back
-// to the relay as session.message frames. Called when a phone connects and
-// asks for recent context.
-func (d *Daemon) replyHistory(req wire.SessionHistoryReq) {
-	if req.SessionID != d.sessID {
+// statusLoop polls the tmux pane every 500 ms and emits session.status
+// frames whenever the spinner / preview / footer-meta combo changes.
+// Skipped when there's no tmux target (jsonl-only / view-only sessions).
+func (s *liveSession) statusLoop(ctx context.Context) {
+	if s.tmuxTarget == "" {
 		return
 	}
-	n := req.Last
-	if n <= 0 {
-		n = 50
-	}
-	if n > 200 {
-		n = 200 // cap to keep the relay buffer happy
-	}
-	recs, err := jsonltail.LastN(d.getJSONLPath(), n)
-	if err != nil {
-		log.Printf("history read failed: %v", err)
-		return
-	}
-	log.Printf("replying with %d history records", len(recs))
-	for _, rec := range recs {
-		frame := wire.Frame{
-			Type: wire.FrameTypeSessionMessage,
-			Seq:  d.seq.Add(1),
-			Payload: wire.SessionMessage{
-				SessionID: d.sessID,
-				Msg: wire.Message{
-					Role:    rec.Role,
-					Content: rec.Content,
-					TS:      rec.TS,
-					ID:      rec.UUID,
-				},
-			},
-		}
-		if err := d.relay.Send(frame); err != nil {
-			log.Printf("history send failed: %v", err)
-			return
-		}
-		// pace the burst so the relay's fanout outbox (64 slots) doesn't drop
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// watchStatus polls the tmux pane every 500ms and pushes Claude Code's
-// activity line (e.g. "✳ Smooshing… (31s · thinking more…)") as a
-// session.status frame whenever it changes. Empty string means idle.
-func (d *Daemon) watchStatus(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	var last string
@@ -281,7 +439,7 @@ func (d *Daemon) watchStatus(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		pane, err := d.tmux.CapturePane(d.cfg.Session.TmuxTarget)
+		pane, err := s.d.tmux.CapturePane(s.tmuxTarget)
 		if err != nil {
 			continue
 		}
@@ -296,19 +454,134 @@ func (d *Daemon) watchStatus(ctx context.Context) {
 			continue
 		}
 		last = combined
-		frame := wire.Frame{
+		select {
+		case s.d.outbound <- wire.Frame{
 			Type: wire.FrameTypeSessionStatus,
-			Seq:  d.seq.Add(1),
 			Payload: wire.SessionStatus{
-				SessionID: d.sessID,
+				SessionID: s.cwd,
 				Status:    status,
 				Preview:   preview,
 				Meta:      meta,
 			},
+		}:
+		case <-ctx.Done():
+			return
 		}
-		_ = d.relay.Send(frame)
 	}
 }
+
+// HandleHistory replies with the last N records from the jsonl, paced so
+// the relay's fanout outbox doesn't drop frames.
+func (s *liveSession) HandleHistory(req wire.SessionHistoryReq) {
+	path := s.currentJSONLPath()
+	if path == "" {
+		log.Printf("session %s: history requested but no jsonl yet", s.cwd)
+		return
+	}
+	n := req.Last
+	if n <= 0 {
+		n = 50
+	}
+	if n > 200 {
+		n = 200 // cap to keep the relay buffer happy
+	}
+	recs, err := jsonltail.LastN(path, n)
+	if err != nil {
+		log.Printf("session %s: history read failed: %v", s.cwd, err)
+		return
+	}
+	log.Printf("session %s: replying with %d history records", s.cwd, len(recs))
+	for _, rec := range recs {
+		select {
+		case s.d.outbound <- wire.Frame{
+			Type: wire.FrameTypeSessionMessage,
+			Payload: wire.SessionMessage{
+				SessionID: s.cwd,
+				Msg: wire.Message{
+					Role:    rec.Role,
+					Content: rec.Content,
+					TS:      rec.TS,
+					ID:      rec.UUID,
+				},
+			},
+		}:
+		default:
+			// Outbound buffer is full — log and bail. Phone can re-request.
+			log.Printf("session %s: outbound full during history send; aborting", s.cwd)
+			return
+		}
+		// pace the burst so the relay's fanout outbox (64 slots) doesn't drop
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// HandleSend pushes phone-typed text into the tmux pane. No-op if this
+// session has no associated pane (shouldn't happen in production since
+// scan only registers cwds with claude panes, but guard anyway).
+func (s *liveSession) HandleSend(req wire.SessionSend) {
+	if s.tmuxTarget == "" {
+		log.Printf("session %s: send dropped — no tmux target", s.cwd)
+		return
+	}
+	if err := s.d.tmux.SendLine(s.tmuxTarget, req.Text); err != nil {
+		log.Printf("session %s: send-keys failed: %v", s.cwd, err)
+	}
+}
+
+// HandleASR transcribes a phone-recorded clip via Bailian. Runs in a
+// goroutine so the dispatch loop isn't blocked by network calls. The
+// session_id on the result frame mirrors the request (so the phone can
+// route the transcript back to the right chat).
+func (s *liveSession) HandleASR(req wire.ASRRequest) {
+	if s.d.asrClient == nil {
+		s.d.outbound <- wire.Frame{
+			Type: wire.FrameTypeASRResult,
+			Payload: wire.ASRResult{
+				RequestID: req.RequestID,
+				Error:     "ASR not configured on agent (missing BAILIAN_API_KEY)",
+			},
+		}
+		return
+	}
+	go s.runASR(req)
+}
+
+func (s *liveSession) runASR(req wire.ASRRequest) {
+	result := wire.ASRResult{RequestID: req.RequestID}
+	defer func() {
+		s.d.outbound <- wire.Frame{
+			Type:    wire.FrameTypeASRResult,
+			Payload: result,
+		}
+	}()
+
+	audio, err := stdBase64.StdEncoding.DecodeString(req.AudioB64)
+	if err != nil {
+		result.Error = fmt.Sprintf("decode audio: %v", err)
+		return
+	}
+	log.Printf("session %s: asr transcribing %d bytes (format=%s, req=%s)",
+		s.cwd, len(audio), req.Format, req.RequestID)
+	transcript, err := s.d.asrClient.Transcribe(audio, req.Format)
+	if err != nil {
+		log.Printf("session %s: asr transcribe failed: %v", s.cwd, err)
+		result.Error = err.Error()
+		return
+	}
+	log.Printf("session %s: asr raw → %q", s.cwd, truncateStr(transcript, 80))
+	cleaned, err := s.d.asrClient.Normalize(transcript)
+	if err != nil {
+		log.Printf("session %s: asr normalize failed, using raw: %v", s.cwd, err)
+		cleaned = transcript
+	} else if cleaned != transcript {
+		log.Printf("session %s: asr cleaned → %q", s.cwd, truncateStr(cleaned, 80))
+	}
+	result.Transcript = cleaned
+}
+
+// ---------------------------------------------------------------------
+// Pure helpers — TUI scrapers, copied verbatim from the old daemon.
+// ---------------------------------------------------------------------
 
 // extractPreview returns ONLY the currently-streaming assistant text block
 // (the last "⏺ …" paragraph), skipping tool invocations (⏺ Bash(...))
@@ -473,52 +746,6 @@ func extractMeta(pane string) string {
 	return strings.Join(out, "\n")
 }
 
-// handleASR receives a phone-recorded clip, runs it through the Bailian ASR
-// proxy, and returns the transcript as an asr.result frame. Any error gets
-// reported back via the same frame's Error field so the phone can surface it.
-func (d *Daemon) handleASR(req wire.ASRRequest) {
-	result := wire.ASRResult{RequestID: req.RequestID}
-	defer func() {
-		frame := wire.Frame{
-			Type:    wire.FrameTypeASRResult,
-			Seq:     d.seq.Add(1),
-			Payload: result,
-		}
-		if err := d.relay.Send(frame); err != nil {
-			log.Printf("asr: send result failed: %v", err)
-		}
-	}()
-
-	if d.asr == nil {
-		result.Error = "ASR not configured on agent (missing BAILIAN_API_KEY)"
-		return
-	}
-	audio, err := stdBase64.StdEncoding.DecodeString(req.AudioB64)
-	if err != nil {
-		result.Error = fmt.Sprintf("decode audio: %v", err)
-		return
-	}
-	log.Printf("asr: transcribing %d bytes (format=%s, req=%s)", len(audio), req.Format, req.RequestID)
-	transcript, err := d.asr.Transcribe(audio, req.Format)
-	if err != nil {
-		log.Printf("asr: transcribe failed: %v", err)
-		result.Error = err.Error()
-		return
-	}
-	log.Printf("asr: raw → %q", truncateStr(transcript, 80))
-	// Fold filler words and fix punctuation via the normalization model. On
-	// failure we fall back to the raw transcript — better something than
-	// nothing, but log it so we can tune the prompt later.
-	cleaned, err := d.asr.Normalize(transcript)
-	if err != nil {
-		log.Printf("asr: normalize failed, using raw: %v", err)
-		cleaned = transcript
-	} else if cleaned != transcript {
-		log.Printf("asr: cleaned → %q", truncateStr(cleaned, 80))
-	}
-	result.Transcript = cleaned
-}
-
 func truncateStr(s string, n int) string {
 	if utf8.RuneCountInString(s) <= n {
 		return s
@@ -526,29 +753,3 @@ func truncateStr(s string, n int) string {
 	runes := []rune(s)
 	return string(runes[:n]) + "…"
 }
-
-// drainIncoming consumes frames in view-only mode. Handles history requests
-// (so restart-the-app "show me context" works) and drops everything else
-// with a log message.
-func (d *Daemon) drainIncoming(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case f, ok := <-d.relay.Incoming():
-			if !ok {
-				return
-			}
-			switch p := f.Payload.(type) {
-			case wire.SessionHistoryReq:
-				d.replyHistory(p)
-				continue
-			case wire.ASRRequest:
-				go d.handleASR(p)
-				continue
-			}
-			log.Printf("view-only: dropping inbound frame type=%s seq=%d", f.Type, f.Seq)
-		}
-	}
-}
-
