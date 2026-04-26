@@ -2,6 +2,7 @@ package tmuxctl
 
 import (
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,4 +101,34 @@ func TestStartSession_NoopIfExists(t *testing.T) {
 		i = j + 1
 	}
 	assert.Equal(t, 1, occurrences)
+}
+
+func TestListAllClaudePanes(t *testing.T) {
+	SetRunner(func(args ...string) ([]byte, error) {
+		if got := strings.Join(args, " "); !strings.Contains(got, "list-panes") {
+			t.Fatalf("unexpected args: %s", got)
+		}
+		return []byte(strings.Join([]string{
+			"%0\tclaude\t/Users/me/proj-a",
+			"%1\tzsh\t/Users/me/proj-a",
+			"%2\tclaude\t/Users/me/proj-b",
+			"%3\tclaude\t/Users/me/proj-a",
+			"",
+		}, "\n")), nil
+	})
+	defer SetRunner(nil)
+
+	panes, err := ListAllClaudePanes()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(panes) != 3 {
+		t.Fatalf("want 3 panes, got %d: %+v", len(panes), panes)
+	}
+	if panes[0].Target != "%0" || panes[0].CWD != "/Users/me/proj-a" {
+		t.Fatalf("first pane: %+v", panes[0])
+	}
+	if panes[2].Target != "%3" {
+		t.Fatalf("third pane: %+v", panes[2])
+	}
 }

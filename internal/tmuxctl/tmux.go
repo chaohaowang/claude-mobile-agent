@@ -160,3 +160,54 @@ func (c *Client) StartSession(name, cwd, command string) error {
 	}
 	return nil
 }
+
+// run is the package-level tmux runner used by package-level helpers (e.g.
+// ListAllClaudePanes). Tests swap it via SetRunner. The default invokes
+// `tmux` on PATH and returns its stdout.
+var run = func(args ...string) ([]byte, error) {
+	return exec.Command("tmux", args...).Output()
+}
+
+// SetRunner overrides the package-level tmux runner. Pass nil to restore the
+// default (real `tmux` exec). Intended for tests.
+func SetRunner(r func(args ...string) ([]byte, error)) {
+	if r == nil {
+		run = func(args ...string) ([]byte, error) {
+			return exec.Command("tmux", args...).Output()
+		}
+		return
+	}
+	run = r
+}
+
+// ClaudePane is one tmux pane currently running `claude`.
+type ClaudePane struct {
+	Target string // e.g. "%3" — usable with `tmux send-keys -t`
+	CWD    string // absolute path of the pane's current working dir
+}
+
+// ListAllClaudePanes scans every tmux pane on every session and returns
+// the ones whose `pane_current_command` is exactly `claude`. cwd comes
+// straight from `pane_current_path`.
+func ListAllClaudePanes() ([]ClaudePane, error) {
+	out, err := run("list-panes", "-a", "-F",
+		"#{pane_id}\t#{pane_current_command}\t#{pane_current_path}")
+	if err != nil {
+		return nil, fmt.Errorf("tmux list-panes: %w", err)
+	}
+	var panes []ClaudePane
+	for _, line := range strings.Split(string(out), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		if parts[1] != "claude" {
+			continue
+		}
+		panes = append(panes, ClaudePane{Target: parts[0], CWD: parts[2]})
+	}
+	return panes, nil
+}
