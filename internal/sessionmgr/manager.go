@@ -27,6 +27,13 @@ func NewRegistry() *Registry {
 // registry but not in desired are stopped and removed. New ids in
 // desired call `spawn(id)` to mint a fresh Watcher. Returns the
 // added/removed id lists for the caller to broadcast as session.list.
+//
+// Concurrency contract: the registry mutex is held while `spawn` and
+// `Watcher.Stop` are invoked. spawn must be cheap (no blocking I/O,
+// no goroutine joins) and must NOT call back into Registry methods —
+// either is a deadlock. Watcher.Stop should be similarly non-blocking;
+// typically a `cancel()` that signals goroutines and returns. Heavier
+// teardown should run in its own goroutine after Stop returns.
 func (r *Registry) Sync(desired []string, spawn func(id string) Watcher) (added, removed []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
