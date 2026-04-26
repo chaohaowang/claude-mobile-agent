@@ -113,6 +113,7 @@ func TestListAllClaudePanes(t *testing.T) {
 			"%1\tzsh\t/Users/me/proj-a",
 			"%2\tclaude\t/Users/me/proj-b",
 			"%3\tclaude\t/Users/me/proj-a",
+			"%4\tclaude.exe\t/Users/me/proj-c", // some installs report a launcher binary
 			"",
 		}, "\n")), nil
 	})
@@ -122,8 +123,8 @@ func TestListAllClaudePanes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if len(panes) != 3 {
-		t.Fatalf("want 3 panes, got %d: %+v", len(panes), panes)
+	if len(panes) != 4 {
+		t.Fatalf("want 4 panes, got %d: %+v", len(panes), panes)
 	}
 	if panes[0].Target != "%0" || panes[0].CWD != "/Users/me/proj-a" {
 		t.Fatalf("first pane: %+v", panes[0])

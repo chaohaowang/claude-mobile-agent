@@ -187,14 +187,10 @@ type ClaudePane struct {
 }
 
 // ListAllClaudePanes scans every tmux pane on every session and returns
-// the ones whose `pane_current_command` is exactly `claude`. cwd comes
-// straight from `pane_current_path`.
-//
-// Note: this is stricter than FindClaudePaneAt above, which uses a
-// case-insensitive substring match. The Mac-wide discovery loop wants
-// exact equality so unrelated processes named `claude-foo` don't show
-// up as session tabs. If Claude Code ever renames its binary, both
-// matchers need updating.
+// the ones running the `claude` CLI. Match policy mirrors FindClaudePaneAt
+// (case-insensitive substring) — empirically tmux reports the command as
+// "claude.exe" on some installs (unclear why; possibly a launcher wrapper),
+// so strict equality misses real panes.
 func ListAllClaudePanes() ([]ClaudePane, error) {
 	out, err := run("list-panes", "-a", "-F",
 		"#{pane_id}\t#{pane_current_command}\t#{pane_current_path}")
@@ -203,8 +199,8 @@ func ListAllClaudePanes() ([]ClaudePane, error) {
 	}
 	var panes []ClaudePane
 	for _, line := range strings.Split(strings.TrimRight(string(out), "\r\n"), "\n") {
-		// Defend against CRLF line endings — equality on parts[1] would
-		// silently fail with a trailing \r and panes would vanish.
+		// Defend against CRLF line endings — substring match on parts[1]
+		// would still hit but we trim for cleanliness in CWD too.
 		line = strings.TrimRight(line, "\r")
 		if line == "" {
 			continue
@@ -213,7 +209,7 @@ func ListAllClaudePanes() ([]ClaudePane, error) {
 		if len(parts) != 3 {
 			continue
 		}
-		if parts[1] != "claude" {
+		if !strings.Contains(strings.ToLower(parts[1]), "claude") {
 			continue
 		}
 		panes = append(panes, ClaudePane{Target: parts[0], CWD: parts[2]})
