@@ -68,3 +68,25 @@ func TestAckMarshal(t *testing.T) {
 	a := out.Payload.(Ack)
 	assert.Equal(t, uint64(98), a.ForSeq)
 }
+
+func TestSessionListReq_RoundTrip(t *testing.T) {
+	f := Frame{
+		Type:    FrameTypeSessionListReq,
+		Seq:     7,
+		Payload: SessionListReq{},
+	}
+	raw, err := json.Marshal(f)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got Frame
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Type != FrameTypeSessionListReq {
+		t.Fatalf("type lost: %s", got.Type)
+	}
+	if _, ok := got.Payload.(SessionListReq); !ok {
+		t.Fatalf("payload type lost: %T", got.Payload)
+	}
+}

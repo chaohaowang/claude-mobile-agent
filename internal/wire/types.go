@@ -14,6 +14,7 @@ const (
 	FrameTypeSessionSend       FrameType = "session.send"
 	FrameTypeSessionInterrupt  FrameType = "session.interrupt"
 	FrameTypeSessionHistoryReq FrameType = "session.history.req"
+	FrameTypeSessionListReq    FrameType = "session.list.req"
 	FrameTypeAck               FrameType = "ack"
 	FrameTypeError             FrameType = "error"
 	FrameTypePing              FrameType = "ping"
@@ -56,6 +57,10 @@ type SessionInfo struct {
 type SessionList struct {
 	Sessions []SessionInfo `json:"sessions"`
 }
+
+// SessionListReq is sent from the phone asking the agent for the current
+// session set. Empty payload — the agent replies with one session.list.
+type SessionListReq struct{}
 
 type SessionMessage struct {
 	SessionID string  `json:"session_id"`
@@ -192,6 +197,8 @@ func (f *Frame) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		payload = p
+	case FrameTypeSessionListReq:
+		payload = SessionListReq{}
 	case FrameTypeAck:
 		var p Ack
 		if err := json.Unmarshal(rf.Payload, &p); err != nil {
