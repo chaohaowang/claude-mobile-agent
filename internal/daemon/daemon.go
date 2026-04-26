@@ -18,13 +18,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/chaohaow/claude-mobile-agent/internal/asr"
-	"github.com/chaohaow/claude-mobile-agent/internal/host"
-	"github.com/chaohaow/claude-mobile-agent/internal/jsonltail"
-	"github.com/chaohaow/claude-mobile-agent/internal/relay"
-	"github.com/chaohaow/claude-mobile-agent/internal/sessionmgr"
-	"github.com/chaohaow/claude-mobile-agent/internal/tmuxctl"
-	"github.com/chaohaow/claude-mobile-agent/internal/wire"
+	"github.com/chaohaowang/claude-mobile-agent/internal/asr"
+	"github.com/chaohaowang/claude-mobile-agent/internal/host"
+	"github.com/chaohaowang/claude-mobile-agent/internal/jsonltail"
+	"github.com/chaohaowang/claude-mobile-agent/internal/relay"
+	"github.com/chaohaowang/claude-mobile-agent/internal/sessionmgr"
+	"github.com/chaohaowang/claude-mobile-agent/internal/tmuxctl"
+	"github.com/chaohaowang/claude-mobile-agent/internal/wire"
 )
 
 // sessionWatcher is what each per-session worker exposes. Superset of
@@ -35,6 +35,7 @@ type sessionWatcher interface {
 	Stop()
 	HandleHistory(req wire.SessionHistoryReq)
 	HandleSend(req wire.SessionSend)
+	HandleInterrupt(req wire.SessionInterrupt)
 	HandleASR(req wire.ASRRequest)
 }
 
@@ -80,6 +81,10 @@ func New(cfg host.Config) *Daemon {
 // then waits for shutdown.
 func (d *Daemon) Run(ctx context.Context) error {
 	d.relay = relay.New(d.cfg.RelayURL, d.cfg.HostID, "agent", "mac-host")
+	// Push a fresh session.list on every (re)connect. Otherwise a phone that
+	// reloaded during the gap (or our daemon got bounced) would sit empty
+	// until a tmux pane change forced a broadcast — looks like a frozen UI.
+	d.relay.OnConnect = d.broadcastSessionList
 	if err := d.relay.Connect(ctx); err != nil {
 		return fmt.Errorf("relay connect: %w", err)
 	}
@@ -156,7 +161,10 @@ func (d *Daemon) inboundLoop(ctx context.Context) {
 }
 
 // outboundLoop drains outbound (every liveSession's emit) onto the relay.
-// Stamps Seq monotonically so the phone can dedupe.
+// Stamps Seq monotonically so the phone can dedupe. On Send failure (relay
+// WS dropped mid-send) we hold the frame and retry every 500 ms instead of
+// dropping it — without this, a brief reconnect window silently swallows any
+// frame in flight (e.g. session.list, history records, ASR results).
 func (d *Daemon) outboundLoop(ctx context.Context) {
 	for {
 		select {
@@ -164,8 +172,19 @@ func (d *Daemon) outboundLoop(ctx context.Context) {
 			return
 		case f := <-d.outbound:
 			f.Seq = d.seq.Add(1)
-			if err := d.relay.Send(f); err != nil {
-				log.Printf("relay send: %v", err)
+			loggedFail := false
+			for {
+				if err := d.relay.Send(f); err == nil {
+					break
+				} else if !loggedFail {
+					log.Printf("relay send: %v (will retry until reconnect)", err)
+					loggedFail = true
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
 			}
 		}
 	}
@@ -185,10 +204,18 @@ func (d *Daemon) dispatch(f wire.Frame) {
 			w.HandleSend(p)
 		}
 	case wire.SessionInterrupt:
-		// Not surfaced yet — phone has no UI for this. Wired here so
-		// adding a button later is one branch.
+		if w := d.getWatcher(p.SessionID); w != nil {
+			w.HandleInterrupt(p)
+		}
 	case wire.SessionListReq:
 		d.broadcastSessionList()
+	case wire.Ping:
+		// Reply so the phone can detect dead WS within its pong-timeout
+		// window. Drop on outbound saturation; the next ping will re-probe.
+		select {
+		case d.outbound <- wire.Frame{Type: wire.FrameTypePong, Payload: wire.Pong{}}:
+		default:
+		}
 	case wire.ASRRequest:
 		if w := d.getWatcher(p.SessionID); w != nil {
 			w.HandleASR(p)
@@ -516,6 +543,18 @@ func (s *liveSession) HandleSend(req wire.SessionSend) {
 	}
 	if err := s.d.tmux.SendLine(s.tmuxTarget, req.Text); err != nil {
 		log.Printf("session %s: send-keys failed: %v", s.cwd, err)
+	}
+}
+
+// HandleInterrupt sends Esc to the tmux pane — Claude Code's "stop the
+// current generation / dismiss prompt" key.
+func (s *liveSession) HandleInterrupt(_ wire.SessionInterrupt) {
+	if s.tmuxTarget == "" {
+		log.Printf("session %s: interrupt dropped — no tmux target", s.cwd)
+		return
+	}
+	if err := s.d.tmux.SendEscape(s.tmuxTarget); err != nil {
+		log.Printf("session %s: send-keys Escape failed: %v", s.cwd, err)
 	}
 }
 

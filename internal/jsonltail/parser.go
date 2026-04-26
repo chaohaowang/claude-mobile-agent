@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chaohaow/claude-mobile-agent/internal/wire"
+	"github.com/chaohaowang/claude-mobile-agent/internal/wire"
 )
 
 // Record is a normalized message extracted from a Claude Code jsonl line.
@@ -88,14 +88,15 @@ func extractContent(msgRaw json.RawMessage) ([]wire.ContentBlock, error) {
 	}
 
 	var blocks []struct {
-		Type      string          `json:"type"`
-		Text      string          `json:"text"`
-		Thinking  string          `json:"thinking"`
-		ID        string          `json:"id"`
-		Name      string          `json:"name"`
-		Input     json.RawMessage `json:"input"`
-		ToolUseID string          `json:"tool_use_id"`
-		Content   json.RawMessage `json:"content"`
+		Type      string             `json:"type"`
+		Text      string             `json:"text"`
+		Thinking  string             `json:"thinking"`
+		ID        string             `json:"id"`
+		Name      string             `json:"name"`
+		Input     json.RawMessage    `json:"input"`
+		ToolUseID string             `json:"tool_use_id"`
+		Content   json.RawMessage    `json:"content"`
+		Source    *wire.ImageSource  `json:"source"`
 	}
 	if err := json.Unmarshal(env.Content, &blocks); err != nil {
 		return nil, err
@@ -109,6 +110,8 @@ func extractContent(msgRaw json.RawMessage) ([]wire.ContentBlock, error) {
 		case "tool_result":
 			cb.ToolUseID = b.ToolUseID
 			cb.Content = b.Content
+		case "image":
+			cb.Source = b.Source
 		}
 		out = append(out, cb)
 	}
@@ -134,12 +137,11 @@ func LastN(path string, n int) ([]Record, error) {
 	if len(all) <= n {
 		return all, nil
 	}
-	// Keep the last n records, PLUS any user-role plain-text records from
-	// before that window — a long session dominated by tool_use/tool_result
-	// can push the user's actual prompts out of the last-N window, which
-	// leaves the phone with a view full of tool activity and no sign of what
-	// the user ever typed. Cap prefix user-text inclusion at 20 to keep the
-	// relay fanout buffer happy.
+	// Keep the last n records, PLUS every user-role plain-text record from
+	// before that window — a tool-heavy session can push 99% of the user's
+	// actual prompts out of the tail-N window. User text is short (rarely
+	// over a few KB each), so even a few hundred prefix entries stay well
+	// under the relay outbound buffer (256 frames).
 	tail := all[len(all)-n:]
 	prefix := all[:len(all)-n]
 	var userTexts []Record
@@ -147,9 +149,6 @@ func LastN(path string, n int) ([]Record, error) {
 		if r.Role == "user" && hasPlainText(r.Content) {
 			userTexts = append(userTexts, r)
 		}
-	}
-	if len(userTexts) > 20 {
-		userTexts = userTexts[len(userTexts)-20:]
 	}
 	out := make([]Record, 0, len(userTexts)+len(tail))
 	out = append(out, userTexts...)

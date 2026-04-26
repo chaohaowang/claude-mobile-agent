@@ -12,7 +12,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/chaohaow/claude-mobile-agent/internal/wire"
+	"github.com/chaohaowang/claude-mobile-agent/internal/wire"
 )
 
 // Ping/pong timing — Alibaba Cloud SLB silently drops idle WebSockets after
@@ -34,6 +34,12 @@ type Client struct {
 	PingInterval     time.Duration
 	PongTimeout      time.Duration
 	WriteTimeout     time.Duration
+
+	// OnConnect fires after every successful dial — initial connect AND each
+	// reconnect. The agent uses this to push a fresh session.list so phones
+	// that already connected during the gap don't sit empty waiting for a
+	// pane-set change. Runs in its own goroutine; safe to do work in.
+	OnConnect func()
 
 	mu       sync.Mutex
 	conn     *websocket.Conn
@@ -99,7 +105,11 @@ func (c *Client) dial(ctx context.Context) error {
 	c.mu.Lock()
 	c.conn = conn
 	c.closed = false
+	hook := c.OnConnect
 	c.mu.Unlock()
+	if hook != nil {
+		go hook()
+	}
 	return nil
 }
 

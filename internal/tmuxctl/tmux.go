@@ -69,6 +69,17 @@ func (c *Client) SendCtrlC(target string) error {
 	return nil
 }
 
+// SendEscape sends a literal Escape key. Claude Code's TUI uses Esc as the
+// canonical "stop the current generation / dismiss menu" key — different
+// from C-c (which would kill the process).
+func (c *Client) SendEscape(target string) error {
+	out, err := exec.Command(c.bin, "send-keys", "-t", target, "Escape").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux send-keys Escape: %w: %s", err, string(out))
+	}
+	return nil
+}
+
 // PaneInfo describes one tmux pane on the current server.
 type PaneInfo struct {
 	Target string // "session:window.pane"

@@ -13,7 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/chaohaow/claude-mobile-agent/internal/wire"
+	"github.com/chaohaowang/claude-mobile-agent/internal/wire"
 )
 
 func startEchoServer(t *testing.T) (*httptest.Server, *[]wire.Frame, *sync.Mutex) {

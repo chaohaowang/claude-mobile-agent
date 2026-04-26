@@ -18,6 +18,7 @@ const (
 	FrameTypeAck               FrameType = "ack"
 	FrameTypeError             FrameType = "error"
 	FrameTypePing              FrameType = "ping"
+	FrameTypePong              FrameType = "pong"
 	FrameTypeASRRequest        FrameType = "asr.request"
 	FrameTypeASRResult         FrameType = "asr.result"
 )
@@ -27,10 +28,19 @@ type ContentBlock struct {
 	Text     string          `json:"text,omitempty"`
 	Thinking string          `json:"thinking,omitempty"`
 	ToolUse  *ToolUse        `json:"tool_use,omitempty"`
+	// image fields — populated when Type == "image"
+	Source *ImageSource `json:"source,omitempty"`
 	// tool_result fields (flat, matching Claude Code's jsonl shape)
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
 	Raw       json.RawMessage `json:"raw,omitempty"`
+}
+
+// ImageSource matches Anthropic's image block shape.
+type ImageSource struct {
+	Type      string `json:"type"`       // "base64"
+	MediaType string `json:"media_type"` // "image/png" / "image/jpeg" / ...
+	Data      string `json:"data"`       // base64-encoded image bytes
 }
 
 type ToolUse struct {
@@ -107,6 +117,12 @@ type SessionHistoryReq struct {
 type Ack struct {
 	ForSeq uint64 `json:"for_seq"`
 }
+
+// Ping is a phone-originated app-layer liveness probe. The agent replies with
+// a Pong so the phone can detect silently-dead WebSockets (iOS Safari /
+// GFW idle drops) without waiting for TCP keepalive.
+type Ping struct{}
+type Pong struct{}
 
 // ASRRequest is a phone → agent request to transcribe a recorded audio clip.
 // Audio is sent inline as base64 to keep everything on one WebSocket; a real
@@ -212,7 +228,9 @@ func (f *Frame) UnmarshalJSON(data []byte) error {
 		}
 		payload = p
 	case FrameTypePing:
-		payload = struct{}{}
+		payload = Ping{}
+	case FrameTypePong:
+		payload = Pong{}
 	case FrameTypeASRRequest:
 		var p ASRRequest
 		if err := json.Unmarshal(rf.Payload, &p); err != nil {

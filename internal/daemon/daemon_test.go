@@ -4,23 +4,25 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chaohaow/claude-mobile-agent/internal/wire"
+	"github.com/chaohaowang/claude-mobile-agent/internal/wire"
 )
 
 // fakeWatcher captures the calls the dispatcher routes to it.
 type fakeWatcher struct {
-	id           string
-	historyCalls []wire.SessionHistoryReq
-	sendCalls    []wire.SessionSend
-	asrCalls     []wire.ASRRequest
-	stopCalls    int
+	id             string
+	historyCalls   []wire.SessionHistoryReq
+	sendCalls      []wire.SessionSend
+	interruptCalls []wire.SessionInterrupt
+	asrCalls       []wire.ASRRequest
+	stopCalls      int
 }
 
-func (f *fakeWatcher) SessionID() string                       { return f.id }
-func (f *fakeWatcher) Stop()                                   { f.stopCalls++ }
-func (f *fakeWatcher) HandleHistory(req wire.SessionHistoryReq) { f.historyCalls = append(f.historyCalls, req) }
-func (f *fakeWatcher) HandleSend(req wire.SessionSend)          { f.sendCalls = append(f.sendCalls, req) }
-func (f *fakeWatcher) HandleASR(req wire.ASRRequest)            { f.asrCalls = append(f.asrCalls, req) }
+func (f *fakeWatcher) SessionID() string                          { return f.id }
+func (f *fakeWatcher) Stop()                                      { f.stopCalls++ }
+func (f *fakeWatcher) HandleHistory(req wire.SessionHistoryReq)   { f.historyCalls = append(f.historyCalls, req) }
+func (f *fakeWatcher) HandleSend(req wire.SessionSend)            { f.sendCalls = append(f.sendCalls, req) }
+func (f *fakeWatcher) HandleInterrupt(req wire.SessionInterrupt)  { f.interruptCalls = append(f.interruptCalls, req) }
+func (f *fakeWatcher) HandleASR(req wire.ASRRequest)              { f.asrCalls = append(f.asrCalls, req) }
 
 func TestDispatch_HistoryReq_RoutesToWatcher(t *testing.T) {
 	d := newTestDaemon(t)

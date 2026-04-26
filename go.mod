@@ -1,4 +1,4 @@
-module github.com/chaohaow/claude-mobile-agent
+module github.com/chaohaowang/claude-mobile-agent
 
 go 1.26.2
 

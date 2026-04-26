@@ -12,8 +12,8 @@ import (
 
 	qrterminal "github.com/mdp/qrterminal/v3"
 
-	"github.com/chaohaow/claude-mobile-agent/internal/daemon"
-	"github.com/chaohaow/claude-mobile-agent/internal/host"
+	"github.com/chaohaowang/claude-mobile-agent/internal/daemon"
+	"github.com/chaohaowang/claude-mobile-agent/internal/host"
 )
 
 func main() {
