@@ -56,23 +56,16 @@ type Daemon struct {
 	// they don't need a real Registry / spawn path.
 	sessionsMu sync.Mutex
 	sessions   map[string]sessionWatcher
-
-	// tmuxTargets: cwd → tmux pane target, captured by the scanner so
-	// liveSessions can issue send-keys / capture-pane against the right
-	// pane. Updated under tmuxTargetsMu on every scan.
-	tmuxTargetsMu sync.Mutex
-	tmuxTargets   map[string]string
 }
 
 // New builds a daemon ready to Run. The host.Config carries HostID
 // (relay pair key) and RelayURL.
 func New(cfg host.Config) *Daemon {
 	d := &Daemon{
-		cfg:         cfg,
-		tmux:        tmuxctl.New(),
-		registry:    sessionmgr.NewRegistry(),
-		outbound:    make(chan wire.Frame, 256),
-		tmuxTargets: make(map[string]string),
+		cfg:      cfg,
+		tmux:     tmuxctl.New(),
+		registry: sessionmgr.NewRegistry(),
+		outbound: make(chan wire.Frame, 256),
 	}
 	if c, err := asr.New(); err == nil {
 		d.asrClient = c
@@ -136,12 +129,6 @@ func (d *Daemon) scanAndSync(ctx context.Context) {
 		ids = append(ids, p.CWD)
 	}
 
-	// Update the cwd→target map under its own lock BEFORE Sync so any
-	// liveSession that's about to spawn can read its target during init.
-	d.tmuxTargetsMu.Lock()
-	d.tmuxTargets = seen
-	d.tmuxTargetsMu.Unlock()
-
 	added, removed := d.registry.Sync(ids, func(id string) sessionmgr.Watcher {
 		// spawn runs under the registry mutex — keep cheap. liveSession's
 		// constructor only schedules goroutines, no blocking I/O.
@@ -151,12 +138,6 @@ func (d *Daemon) scanAndSync(ctx context.Context) {
 		log.Printf("session set: +%v -%v (now %d)", added, removed, len(ids))
 		d.broadcastSessionList()
 	}
-}
-
-func (d *Daemon) tmuxTargetFor(cwd string) string {
-	d.tmuxTargetsMu.Lock()
-	defer d.tmuxTargetsMu.Unlock()
-	return d.tmuxTargets[cwd]
 }
 
 // inboundLoop pumps frames from the relay into dispatch.
@@ -266,9 +247,17 @@ func (d *Daemon) broadcastSessionList() {
 			})
 		}
 	}
-	d.outbound <- wire.Frame{
+	// Non-blocking send: if the relay's outbound channel is saturated, drop
+	// the session.list update rather than wedge the inbound loop. Phone
+	// will catch up on the next scan-driven broadcast or session.list.req.
+	frame := wire.Frame{
 		Type:    wire.FrameTypeSessionList,
 		Payload: wire.SessionList{Sessions: sessions},
+	}
+	select {
+	case d.outbound <- frame:
+	default:
+		log.Printf("outbound full, dropped session.list (%d sessions)", len(sessions))
 	}
 }
 
@@ -282,6 +271,7 @@ type liveSession struct {
 	d          *Daemon
 	cwd        string // also the session_id
 	tmuxTarget string // pane target captured at spawn time
+	ctx        context.Context
 	cancel     context.CancelFunc
 
 	pathMu    sync.Mutex
@@ -324,6 +314,7 @@ func (d *Daemon) spawnLiveSession(parent context.Context, cwd, tmuxTarget string
 		d:          d,
 		cwd:        cwd,
 		tmuxTarget: tmuxTarget,
+		ctx:        ctx,
 		cancel:     cancel,
 		jsonlPath:  jsonl,
 	}
@@ -534,26 +525,30 @@ func (s *liveSession) HandleSend(req wire.SessionSend) {
 // route the transcript back to the right chat).
 func (s *liveSession) HandleASR(req wire.ASRRequest) {
 	if s.d.asrClient == nil {
-		s.d.outbound <- wire.Frame{
-			Type: wire.FrameTypeASRResult,
-			Payload: wire.ASRResult{
-				RequestID: req.RequestID,
-				Error:     "ASR not configured on agent (missing BAILIAN_API_KEY)",
-			},
-		}
+		s.sendASRResult(wire.ASRResult{
+			RequestID: req.RequestID,
+			Error:     "ASR not configured on agent (missing BAILIAN_API_KEY)",
+		})
 		return
 	}
 	go s.runASR(req)
 }
 
+// sendASRResult emits an ASRResult frame, but won't block forever: if the
+// outbound channel is saturated and the daemon ctx is canceled, the result
+// is dropped so the goroutine doesn't leak after outboundLoop has exited.
+func (s *liveSession) sendASRResult(result wire.ASRResult) {
+	frame := wire.Frame{Type: wire.FrameTypeASRResult, Payload: result}
+	select {
+	case s.d.outbound <- frame:
+	case <-s.ctx.Done():
+		log.Printf("session %s: dropped ASR result on shutdown (req=%s)", s.cwd, result.RequestID)
+	}
+}
+
 func (s *liveSession) runASR(req wire.ASRRequest) {
 	result := wire.ASRResult{RequestID: req.RequestID}
-	defer func() {
-		s.d.outbound <- wire.Frame{
-			Type:    wire.FrameTypeASRResult,
-			Payload: result,
-		}
-	}()
+	defer s.sendASRResult(result)
 
 	audio, err := stdBase64.StdEncoding.DecodeString(req.AudioB64)
 	if err != nil {
