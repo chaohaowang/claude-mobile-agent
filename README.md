@@ -1,110 +1,90 @@
 # claude-mobile-agent
 
-Bridges a Claude Code tmux session on macOS to a WebSocket relay so a phone
-client can see and drive the session. See
-`docs/superpowers/specs/2026-04-23-mobile-claude-terminal-bridge-design.md`
-for the full design.
+Bridge your Mac's [Claude Code](https://docs.claude.com/claude-code) sessions to your iPhone over WebSocket. Read messages, drive the prompt, send `Esc` — all from your phone, while Claude keeps running in tmux on your Mac.
+
+```
+Claude CLI (tmux pane) → jsonl tail → daemon → relay (VPS) → iPhone web
+```
 
 ## Install
 
 ```bash
-go build -o claude-mobile ./cmd/claude-mobile
-# (optional) put on PATH so `cm` works from anywhere:
-install -m 0755 claude-mobile /usr/local/bin/claude-mobile
-echo "alias cm='claude-mobile start'" >> ~/.zshrc
+curl -fsSL https://raw.githubusercontent.com/chaohaowang/claude-mobile-agent/main/install.sh | bash
 ```
 
-## One-shot quick start
+Installs the latest `claude-mobile` binary into `~/.local/bin/`. Or grab a tarball from the [releases](https://github.com/chaohaowang/claude-mobile-agent/releases) page and extract it yourself.
 
-Once per setup, write `~/.config/claude-mobile/config.toml` with only the
-[relay] section:
-
-```toml
-[relay]
-url = "ws://47.79.84.115:8443/ws"    # your relay
-pair_id = "my-pair"                   # any stable string, matches the phone
-device_id = "mac-$(hostname -s)"      # for server-side logging
-```
-
-Then, in any project folder:
+## Quick start
 
 ```bash
-cd ~/some-project
-claude-mobile start           # or: cm
-```
+# 1. Pair your iPhone — prints a QR code + URL.
+claude-mobile pair
 
-This spawns a tmux session `cm-some-project` running
-`claude --permission-mode bypassPermissions` in the cwd, then runs the bridge
-daemon in the foreground. Ctrl-C stops the daemon; the tmux session stays
-alive — reattach with `tmux attach -t cm-some-project`.
+#    Scan with the iPhone camera (or open the URL in Safari) and bookmark it.
 
-Override the permission mode:
-```bash
-claude-mobile start --permission-mode default
-```
+# 2. Start a tmux session running Claude:
+tmux new-session -d -s work 'claude'
 
-Target a different directory:
-```bash
-claude-mobile start ~/other-project
-```
-
-Rename the session:
-```bash
-claude-mobile start --name fe-work .
-```
-
-## Full `daemon` mode (explicit config)
-
-Use when you want to drive an existing tmux session or script the daemon
-without `start`'s conveniences. Requires both [relay] and [session] sections:
-
-```toml
-[relay]
-url = "ws://47.79.84.115:8443/ws"
-pair_id = "my-pair"
-device_id = "mac-abc"
-
-[session]
-tmux_target = "cm-foo:0"
-cwd = "/Users/me/foo"
-name = "foo"
-```
-
-```bash
+# 3. Run the daemon in the foreground:
 claude-mobile daemon
 ```
 
-## Manual smoke test (no phone, uses websocat)
+The daemon auto-discovers any tmux pane running `claude` and exposes them all as tabs in the iPhone web client.
 
-Install [websocat](https://github.com/vi/websocat): `brew install websocat`.
+## Requirements
 
-Terminal 1 — act as phone:
+- macOS 13+ (Apple Silicon or Intel)
+- `tmux` — `brew install tmux`
+- `claude` CLI — Anthropic [Claude Code](https://docs.claude.com/claude-code)
+
+## Configuration
+
+Auto-generated on first run at `~/.config/claude-mobile/host.toml`:
+
+```toml
+host_id    = "host-xxxxxxxxxxxx"        # random per-Mac id
+relay_url  = "ws://47.79.84.115:8443/ws"  # shared relay (default)
+public_url = "http://47.79.84.115:8443"   # baked into the pair QR
+```
+
+Edit `relay_url` / `public_url` to point at your own relay.
+
+## Optional: voice input (ASR)
+
+If you want to dictate prompts from the phone, export an Aliyun Bailian key before starting the daemon:
+
 ```bash
-websocat -t "ws://47.79.84.115:8443/ws?pair=my-pair&role=phone&device=test"
+export BAILIAN_API_KEY="sk-xxxxxxxx"
+claude-mobile daemon
 ```
 
-Terminal 2 — start agent:
+The daemon uses `qwen3-asr-flash`. Without the key, ASR returns "not configured" to the phone; everything else still works.
+
+## Troubleshooting
+
+**`"claude-mobile" can't be opened` (Gatekeeper)** — the binary isn't notarized. The installer pipes via `curl` and avoids quarantine, but if you downloaded a tarball through Safari:
+
 ```bash
-cd ~/some-project
-claude-mobile start
+xattr -d com.apple.quarantine ~/.local/bin/claude-mobile
 ```
 
-In Terminal 1, paste a frame to drive Claude:
-```json
-{"type":"session.send","seq":1,"payload":{"session_id":"some-project","text":"hi","is_slash":false,"request_id":"r1"}}
+Or right-click → Open once, then macOS remembers it.
+
+**`command not found: claude-mobile`** — add `~/.local/bin` to your `PATH`:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
 ```
 
-Messages Claude emits (from the jsonl tail) flow back to Terminal 1.
+**iPhone shows blank or stuck** — check the daemon is alive:
 
-## Config reference
+```bash
+pgrep -fl 'claude-mobile daemon'
+```
 
-| Key | Required by | Default | Purpose |
-|---|---|---|---|
-| `relay.url` | start, daemon | — | WebSocket URL |
-| `relay.pair_id` | start, daemon | — | routing id, shared with phone |
-| `relay.device_id` | start, daemon | — | server-side logging id |
-| `relay.reconnect_initial_sec` | — | 5 | initial backoff |
-| `relay.reconnect_max_sec` | — | 60 | max backoff |
-| `session.tmux_target` | daemon only | — | `<sess>:<window>` |
-| `session.cwd` | daemon only | — | cwd the Claude session runs in |
-| `session.name` | daemon only | `default` | session display name |
+Restart it: `pkill -f 'claude-mobile daemon'; claude-mobile daemon &`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
