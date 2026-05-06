@@ -283,8 +283,37 @@ func (d *Daemon) broadcastSessionList() {
 	}
 	select {
 	case d.outbound <- frame:
+		// Replay each session's last status so the phone's MetaStrip /
+		// activity line populates immediately instead of waiting for the
+		// next on-pane change.
+		d.replayStatuses()
 	default:
 		log.Printf("outbound full, dropped session.list (%d sessions)", len(sessions))
+	}
+}
+
+// replayStatuses pushes each live session's most recent status frame
+// (if any) into the outbound channel. Called right after a session.list
+// broadcast so the phone has matching meta/activity for every tab.
+func (d *Daemon) replayStatuses() {
+	if d.registry == nil {
+		return
+	}
+	for _, id := range d.registry.IDs() {
+		w := d.registry.Get(id)
+		ls, ok := w.(*liveSession)
+		if !ok {
+			continue
+		}
+		snap := ls.snapshotStatus()
+		if snap == nil {
+			continue
+		}
+		select {
+		case d.outbound <- wire.Frame{Type: wire.FrameTypeSessionStatus, Payload: *snap}:
+		default:
+			// Skip silently; the next tick will reconcile.
+		}
 	}
 }
 
@@ -303,6 +332,12 @@ type liveSession struct {
 
 	pathMu    sync.Mutex
 	jsonlPath string
+
+	// lastStatus caches the most recent session.status frame so a freshly
+	// connected phone (or session.list.req) can be replayed without waiting
+	// for the next change tick.
+	statusMu   sync.Mutex
+	lastStatus *wire.SessionStatus
 }
 
 func (s *liveSession) SessionID() string { return s.cwd }
@@ -472,20 +507,38 @@ func (s *liveSession) statusLoop(ctx context.Context) {
 			continue
 		}
 		last = combined
+		payload := wire.SessionStatus{
+			SessionID: s.cwd,
+			Status:    status,
+			Preview:   preview,
+			Meta:      meta,
+		}
+		s.statusMu.Lock()
+		s.lastStatus = &payload
+		s.statusMu.Unlock()
 		select {
 		case s.d.outbound <- wire.Frame{
-			Type: wire.FrameTypeSessionStatus,
-			Payload: wire.SessionStatus{
-				SessionID: s.cwd,
-				Status:    status,
-				Preview:   preview,
-				Meta:      meta,
-			},
+			Type:    wire.FrameTypeSessionStatus,
+			Payload: payload,
 		}:
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// snapshotStatus returns the most recent status frame emitted for this
+// session, or nil if none has been computed yet. Used by broadcastSessionList
+// so a freshly-connected phone can populate its MetaStrip without waiting
+// for the next on-disk change.
+func (s *liveSession) snapshotStatus() *wire.SessionStatus {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+	if s.lastStatus == nil {
+		return nil
+	}
+	cp := *s.lastStatus
+	return &cp
 }
 
 // HandleHistory replies with the last N records from the jsonl, paced so
